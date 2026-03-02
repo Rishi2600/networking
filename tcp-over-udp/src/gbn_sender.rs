@@ -158,6 +158,17 @@ pub struct GbnSender {
     /// In-flight segments ordered by sequence number (front = oldest).
     pub(crate) window: VecDeque<GbnEntry>,
 
+    // ── Receiver-side flow control ───────────────────────────────────────
+
+    /// Peer's advertised receive window in bytes (`rwnd`).
+    ///
+    /// Updated each time an ACK is received via [`update_peer_rwnd`].
+    /// Initialised to `u16::MAX` so the congestion window governs until the
+    /// first ACK arrives carrying the peer's actual buffer size.
+    ///
+    /// [`update_peer_rwnd`]: Self::update_peer_rwnd
+    peer_rwnd: usize,
+
     // ── Reno congestion control ──────────────────────────────────────────
 
     /// Congestion window in segments (Reno-managed).
@@ -193,6 +204,7 @@ impl GbnSender {
             next_seq: seq_start,
             window_size,
             window: VecDeque::with_capacity(window_size),
+            peer_rwnd: u16::MAX as usize,
             cwnd: INITIAL_CWND,
             ssthresh: INITIAL_SSTHRESH,
             cc_state: CongestionState::SlowStart,
@@ -207,11 +219,22 @@ impl GbnSender {
 
     /// `true` when there is room for at least one more in-flight segment.
     ///
-    /// The effective window is `min(window_size, cwnd)`, so both the receiver
-    /// window and the congestion window must have capacity.
+    /// Three constraints must all be satisfied simultaneously:
+    ///
+    /// 1. **Segment count**: `in_flight < min(window_size, cwnd)`
+    /// 2. **Byte budget**: `bytes_in_flight < peer_rwnd` (receiver flow control)
+    ///
+    /// When `peer_rwnd == 0` the sender pauses regardless of cwnd; it will
+    /// resume once the peer ACKs with a non-zero window (or after a
+    /// zero-window probe triggers an updated ACK).
     pub fn can_send(&self) -> bool {
         let effective = self.window_size.min(self.cwnd);
-        self.window.len() < effective
+        self.window.len() < effective && self.bytes_in_flight() < self.peer_rwnd
+    }
+
+    /// Total payload bytes currently in the send window (in flight).
+    pub fn bytes_in_flight(&self) -> usize {
+        self.window.iter().map(|e| e.packet.payload.len()).sum()
     }
 
     /// Number of segments currently awaiting acknowledgement.
@@ -467,6 +490,24 @@ impl GbnSender {
     /// Returns `None` when the window is empty.
     pub fn oldest_sent_at(&self) -> Option<Instant> {
         self.window.front().map(|e| e.sent_at)
+    }
+
+    // -----------------------------------------------------------------------
+    // Flow-control methods
+    // -----------------------------------------------------------------------
+
+    /// Update the sender's view of the peer's receive window.
+    ///
+    /// Call this every time an ACK arrives — the ACK's `window` field carries
+    /// the peer's current free buffer space in bytes.
+    pub fn update_peer_rwnd(&mut self, rwnd: u16) {
+        self.peer_rwnd = rwnd as usize;
+        log::trace!("[sender] peer_rwnd updated to {}", self.peer_rwnd);
+    }
+
+    /// Peer's current advertised receive window in bytes.
+    pub fn peer_rwnd(&self) -> usize {
+        self.peer_rwnd
     }
 
     // -----------------------------------------------------------------------

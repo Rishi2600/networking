@@ -799,3 +799,191 @@ async fn test_congestion_control_cwnd_grows_on_loopback() {
     assert_eq!(total, MSG_COUNT * 4);
     assert!(cwnd > 1, "final cwnd={cwnd} must reflect SS growth");
 }
+
+// ---------------------------------------------------------------------------
+// Test 20: receiver advertises free space dynamically
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recv_window_advertises_free_space() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+
+    let mut r = GbnReceiver::with_capacity(0, 100);
+    assert_eq!(r.window_size(), 100, "full capacity advertised when empty");
+
+    // Accept 40 bytes — free space drops to 60.
+    assert!(r.on_segment(0, &[0u8; 40]));
+    assert_eq!(r.window_size(), 60, "window must shrink by bytes buffered");
+
+    // Application drains 20 bytes — free space rises to 80.
+    let mut buf = [0u8; 20];
+    r.read(&mut buf);
+    assert_eq!(r.window_size(), 80, "window must grow after app drains buffer");
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: full receive buffer rejects subsequent in-order segments
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recv_full_buffer_rejects_segment() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+
+    let mut r = GbnReceiver::with_capacity(0, 20);
+
+    // Fill to capacity — must be accepted.
+    assert!(r.on_segment(0, &[0u8; 20]), "segment filling capacity must be accepted");
+    assert_eq!(r.window_size(), 0, "window must be zero when buffer is full");
+
+    // Next in-order byte is rejected (no space).
+    let rejected = r.on_segment(20, &[0u8; 1]);
+    assert!(!rejected, "in-order segment must be rejected when buffer full");
+    assert_eq!(r.rcv_nxt, 20, "rcv_nxt must not advance on full-buffer rejection");
+
+    // Drain; the segment now fits.
+    let mut drain = [0u8; 20];
+    r.read(&mut drain);
+    assert_eq!(r.window_size(), 20, "window must reopen after drain");
+    assert!(r.on_segment(20, &[0u8; 1]), "segment must be accepted after drain");
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: sender pauses immediately when peer_rwnd drops to zero
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sender_pauses_on_zero_peer_rwnd() {
+    use tcp_over_udp::gbn_sender::GbnSender;
+
+    let mut s = GbnSender::new(0, 8);
+    s.cwnd = 4; // cwnd is permissive; rwnd should be the binding constraint
+
+    // No in-flight segments; peer_rwnd = 0 → cannot send.
+    s.update_peer_rwnd(0);
+    assert!(!s.can_send(), "sender must pause when peer_rwnd == 0");
+
+    // Open the window; sender should resume.
+    s.update_peer_rwnd(100);
+    assert!(s.can_send(), "sender must resume when peer_rwnd > 0");
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: bytes_in_flight tracks byte totals and bounds can_send
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bytes_in_flight_tracks_payload_size() {
+    use tcp_over_udp::gbn_sender::GbnSender;
+
+    let mut s = GbnSender::new(0, 8);
+    s.cwnd = 4;
+    s.update_peer_rwnd(200);
+
+    // Send 3 × 20-byte segments.
+    for _ in 0..3 {
+        let p = s.build_data_packet(vec![0u8; 20], 0, 8192);
+        s.record_sent(p);
+    }
+    assert_eq!(s.bytes_in_flight(), 60, "bytes_in_flight must sum payloads");
+    assert!(s.can_send(), "60 < 200 → can still send");
+
+    // Tighten peer_rwnd to exactly in-flight; one more byte wouldn't fit.
+    s.update_peer_rwnd(60);
+    assert!(
+        !s.can_send(),
+        "bytes_in_flight == peer_rwnd → can_send must be false (strictly less-than check)"
+    );
+
+    // Loosen by 1 byte.
+    s.update_peer_rwnd(61);
+    assert!(s.can_send(), "61 > 60 → can_send must be true");
+}
+
+// ---------------------------------------------------------------------------
+// Test 24: integration — small receive buffer, data flows correctly
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_flow_control_small_recv_buffer() {
+    // Server has a 256-byte receive buffer; client uses the default.
+    // 20 × 10-byte messages = 200 bytes total.  The test verifies that all
+    // data is delivered correctly even with a constrained receiver buffer and
+    // that the client observed the server's actual (non-default) rwnd.
+    const WINDOW: usize = 4;
+    const MSG_COUNT: usize = 20;
+    const MSG_SIZE: usize = 10;
+    const RECV_BUF: usize = 256;
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        // Server with restricted receive buffer.
+        let mut conn = GbnConnection::accept_with_recv_buf(server_sock, WINDOW, RECV_BUF)
+            .await
+            .expect("accept");
+
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        loop {
+            match conn.recv().await {
+                Ok(data) => received.push(data),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv error: {e}"),
+            }
+            if received.len() == MSG_COUNT {
+                break;
+            }
+        }
+        conn.close().await.ok();
+
+        // Return the final peer_rwnd the server's sender observed from the
+        // client's ACKs.  Should reflect the client's actual buffer (64 KiB
+        // default), not the old static 8192.
+        let peer_rwnd = conn.sender.peer_rwnd();
+        (received, peer_rwnd)
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        for i in 0..MSG_COUNT {
+            let msg = vec![i as u8; MSG_SIZE];
+            conn.send(&msg).await.expect("client send");
+        }
+        conn.flush().await.expect("flush");
+
+        // The client's sender.peer_rwnd reflects the server's advertised
+        // window.  It must be ≤ RECV_BUF (the server's capacity), not the
+        // old static 8192.
+        let peer_rwnd = conn.sender.peer_rwnd();
+        conn.close().await.ok();
+        peer_rwnd
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    let (received, server_peer_rwnd) = sr.unwrap();
+    let client_peer_rwnd = cr.unwrap();
+
+    // All messages received correctly.
+    assert_eq!(received.len(), MSG_COUNT, "server must receive all messages");
+    for (i, chunk) in received.iter().enumerate() {
+        assert_eq!(chunk.len(), MSG_SIZE);
+        assert!(
+            chunk.iter().all(|&b| b == i as u8),
+            "message {i} corrupted"
+        );
+    }
+
+    // Dynamic rwnd was observed: both sides advertised their real buffer sizes.
+    assert!(
+        client_peer_rwnd <= RECV_BUF,
+        "client must have seen peer_rwnd ≤ RECV_BUF={RECV_BUF}, got {client_peer_rwnd}"
+    );
+    assert!(
+        server_peer_rwnd > 8192,
+        "server must have seen client's large default buffer (> 8192), got {server_peer_rwnd}"
+    );
+}

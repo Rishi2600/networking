@@ -1,12 +1,14 @@
-//! Go-Back-N receive-side state machine.
+//! Go-Back-N receive-side state machine with receiver-side flow control.
 //!
 //! [`GbnReceiver`] implements the receiver side of Go-Back-N:
 //!
 //! - Only **in-order** segments are accepted (seq == `rcv_nxt`).
 //! - Out-of-order or duplicate segments are **silently discarded**.
+//! - Segments are also rejected when the receive buffer is full (no space).
 //! - After every segment (accepted or not) the caller should send a
-//!   **cumulative ACK** containing [`ack_number`] = `rcv_nxt`, which tells
-//!   the sender the highest contiguous sequence number received.
+//!   **cumulative ACK** containing [`ack_number`] = `rcv_nxt` **and**
+//!   [`window_size`] = free bytes, which together implement RFC 793
+//!   receive-window flow control.
 //!
 //! This module only manages state; all socket I/O is the caller's
 //! responsibility (same pattern as [`crate::receiver::Receiver`]).
@@ -18,6 +20,10 @@ use std::collections::VecDeque;
 // ---------------------------------------------------------------------------
 
 /// Go-Back-N receive-side state for one connection.
+///
+/// The advertised window (`rwnd`) is computed dynamically as
+/// `capacity − bytes_buffered`.  Every ACK the connection layer sends
+/// reflects the current free space, enabling receiver-side flow control.
 #[derive(Debug)]
 pub struct GbnReceiver {
     /// Next expected sequence number (`RCV.NXT`).
@@ -28,39 +34,57 @@ pub struct GbnReceiver {
     /// In-order payload bytes buffered for the application.
     pub app_buffer: VecDeque<u8>,
 
-    /// Advertised receive window (constant for GBN; no flow control needed).
-    window: u16,
+    /// Maximum number of bytes `app_buffer` may hold.
+    ///
+    /// `window_size()` returns `capacity − app_buffer.len()`, clamped to
+    /// [`u16::MAX`].  When the buffer is full `window_size()` returns 0.
+    capacity: usize,
 }
 
 impl GbnReceiver {
-    /// Create a new [`GbnReceiver`].
+    /// Create a new [`GbnReceiver`] with a 64 KiB receive buffer.
     ///
     /// `rcv_nxt` is the first sequence number expected from the peer.  After
     /// a completed 3-way handshake this is `peer_isn + 1`.
     pub fn new(rcv_nxt: u32) -> Self {
+        Self::with_capacity(rcv_nxt, 65536)
+    }
+
+    /// Create a [`GbnReceiver`] with a custom receive-buffer capacity.
+    ///
+    /// Use a small `capacity` in tests to exercise flow control with limited
+    /// buffer space.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity == 0`.
+    pub fn with_capacity(rcv_nxt: u32, capacity: usize) -> Self {
+        assert!(capacity > 0, "recv buffer capacity must be at least 1 byte");
         Self {
             rcv_nxt,
             app_buffer: VecDeque::new(),
-            window: 8192,
+            capacity,
         }
     }
 
     /// Process an inbound segment.
     ///
-    /// Returns `true` if the segment was **accepted** (seq == `rcv_nxt`) and
-    /// its payload was appended to the application buffer.
+    /// Returns `true` if the segment was **accepted** and its payload appended
+    /// to the application buffer.  Returns `false` in any of these cases:
     ///
-    /// Returns `false` for an out-of-order (seq > `rcv_nxt`) or duplicate
-    /// (seq < `rcv_nxt`) segment — GBN discards both without buffering.  The
-    /// caller should still send a cumulative ACK with the unchanged
-    /// [`ack_number`] in both cases.
+    /// - **Out-of-order** (seq > `rcv_nxt`) — GBN discards without buffering.
+    /// - **Duplicate** (seq < `rcv_nxt`) — already received, discard.
+    /// - **Buffer full** — no free space; payload would exceed `capacity`.
+    ///
+    /// In every case the caller should send a cumulative ACK with the
+    /// *unchanged* [`ack_number`] and the current (possibly zero) [`window_size`].
     pub fn on_segment(&mut self, seq: u32, payload: &[u8]) -> bool {
-        if seq == self.rcv_nxt {
+        let free = self.capacity.saturating_sub(self.app_buffer.len());
+        if seq == self.rcv_nxt && payload.len() <= free {
             self.app_buffer.extend(payload.iter().copied());
             self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
             true
         } else {
-            // Out-of-order or duplicate: drop (GBN does not buffer OOO data).
             false
         }
     }
@@ -81,9 +105,14 @@ impl GbnReceiver {
         self.rcv_nxt
     }
 
-    /// Advertised receive window to place in outbound packets.
+    /// Advertised receive window (free bytes) to place in outbound packets.
+    ///
+    /// Returns the number of bytes the application buffer can still accept,
+    /// clamped to [`u16::MAX`].  A return value of `0` (buffer full) tells
+    /// the sender to stop transmitting until a later ACK opens the window.
     pub fn window_size(&self) -> u16 {
-        self.window
+        let free = self.capacity.saturating_sub(self.app_buffer.len());
+        free.min(u16::MAX as usize) as u16
     }
 
     /// Copy up to `buf.len()` in-order bytes from the application buffer into
@@ -111,6 +140,8 @@ mod tests {
         assert_eq!(r.rcv_nxt, 42);
         assert!(r.app_buffer.is_empty());
         assert_eq!(r.ack_number(), 42);
+        // Default capacity is 65536.
+        assert_eq!(r.window_size(), 65535); // clamped to u16::MAX
     }
 
     #[test]
@@ -201,5 +232,38 @@ mod tests {
         let accepted = r.on_segment(start, b"abcde");
         assert!(accepted);
         assert_eq!(r.rcv_nxt, start.wrapping_add(5));
+    }
+
+    // ── Flow control ────────────────────────────────────────────────────────
+
+    #[test]
+    fn window_size_reflects_free_space() {
+        let mut r = GbnReceiver::with_capacity(0, 100);
+        assert_eq!(r.window_size(), 100, "full capacity advertised when empty");
+
+        r.on_segment(0, &[0u8; 40]);
+        assert_eq!(r.window_size(), 60, "window shrinks by bytes buffered");
+
+        let mut buf = [0u8; 20];
+        r.read(&mut buf);
+        assert_eq!(r.window_size(), 80, "window grows after app drains");
+    }
+
+    #[test]
+    fn full_buffer_rejects_segment() {
+        let mut r = GbnReceiver::with_capacity(0, 20);
+        assert!(r.on_segment(0, &[0u8; 20]), "exact fill must be accepted");
+        assert_eq!(r.window_size(), 0, "window must be 0 when full");
+
+        // Next in-order segment must be rejected (buffer full).
+        let rejected = r.on_segment(20, &[0u8; 1]);
+        assert!(!rejected, "segment must be rejected when buffer full");
+        assert_eq!(r.rcv_nxt, 20, "rcv_nxt must not advance on rejection");
+
+        // After draining, the segment fits.
+        let mut drain = [0u8; 20];
+        r.read(&mut drain);
+        assert_eq!(r.window_size(), 20);
+        assert!(r.on_segment(20, &[0u8; 1]), "segment accepted after drain");
     }
 }

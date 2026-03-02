@@ -111,19 +111,40 @@ impl GbnConnection {
     /// The 3-way handshake must be complete.  `window_size` sets the GBN
     /// window N.  A fresh [`RttEstimator`] is started — RTT history from
     /// the handshake is not carried over.
+    ///
+    /// Uses the default receive-buffer capacity (64 KiB).  For a custom
+    /// capacity use [`from_connection_with_recv_buf`].
+    ///
+    /// [`from_connection_with_recv_buf`]: Self::from_connection_with_recv_buf
     pub fn from_connection(conn: Connection, window_size: usize) -> Self {
+        Self::from_connection_with_recv_buf(conn, window_size, 65536)
+    }
+
+    /// Like [`from_connection`] but with an explicit receive-buffer capacity.
+    ///
+    /// Use a small `recv_buf_bytes` value in tests to exercise flow control
+    /// with limited buffer space.
+    ///
+    /// [`from_connection`]: Self::from_connection
+    pub fn from_connection_with_recv_buf(
+        conn: Connection,
+        window_size: usize,
+        recv_buf_bytes: usize,
+    ) -> Self {
         let (state, socket, peer, next_seq, rcv_nxt, _rto) = conn.into_parts();
         Self {
             state,
             socket: Arc::new(socket),
             peer,
             sender: GbnSender::new(next_seq, window_size),
-            receiver: GbnReceiver::new(rcv_nxt),
+            receiver: GbnReceiver::with_capacity(rcv_nxt, recv_buf_bytes),
             rtt: RttEstimator::new(),
         }
     }
 
     /// Active open (client): run the 3-way handshake then return a GBN connection.
+    ///
+    /// Uses the default receive-buffer capacity (64 KiB).
     pub async fn connect(
         socket: Socket,
         peer: SocketAddr,
@@ -133,10 +154,37 @@ impl GbnConnection {
         Ok(Self::from_connection(conn, window_size))
     }
 
+    /// Like [`connect`] but with an explicit receive-buffer capacity.
+    ///
+    /// [`connect`]: Self::connect
+    pub async fn connect_with_recv_buf(
+        socket: Socket,
+        peer: SocketAddr,
+        window_size: usize,
+        recv_buf_bytes: usize,
+    ) -> Result<Self, ConnError> {
+        let conn = Connection::connect(socket, peer).await?;
+        Ok(Self::from_connection_with_recv_buf(conn, window_size, recv_buf_bytes))
+    }
+
     /// Passive open (server): accept one incoming connection and return GBN.
+    ///
+    /// Uses the default receive-buffer capacity (64 KiB).
     pub async fn accept(socket: Socket, window_size: usize) -> Result<Self, ConnError> {
         let conn = Connection::accept(socket).await?;
         Ok(Self::from_connection(conn, window_size))
+    }
+
+    /// Like [`accept`] but with an explicit receive-buffer capacity.
+    ///
+    /// [`accept`]: Self::accept
+    pub async fn accept_with_recv_buf(
+        socket: Socket,
+        window_size: usize,
+        recv_buf_bytes: usize,
+    ) -> Result<Self, ConnError> {
+        let conn = Connection::accept(socket).await?;
+        Ok(Self::from_connection_with_recv_buf(conn, window_size, recv_buf_bytes))
     }
 
     // -----------------------------------------------------------------------
@@ -184,15 +232,22 @@ impl GbnConnection {
                     if retries > MAX_RETRIES {
                         return Err(ConnError::MaxRetriesExceeded);
                     }
-                    self.retransmit_window().await?;
-                    self.sender.on_retransmit();
-                    self.sender.on_timeout_cc();
-                    self.rtt.back_off();
-                    rto = self.rtt.rto();
-                    log::debug!(
-                        "[gbn] timeout — back-off rto={:?} cwnd={} ssthresh={}",
-                        rto, self.sender.cwnd(), self.sender.ssthresh()
-                    );
+                    if self.sender.peer_rwnd() == 0 {
+                        // Flow-control stall: probe without CC penalty.
+                        self.probe_zero_window().await?;
+                        rto = (rto * 2).min(Duration::from_secs(64));
+                        log::debug!("[gbn] zero-window probe — rto={:?}", rto);
+                    } else {
+                        self.retransmit_window().await?;
+                        self.sender.on_retransmit();
+                        self.sender.on_timeout_cc();
+                        self.rtt.back_off();
+                        rto = self.rtt.rto();
+                        log::debug!(
+                            "[gbn] timeout — back-off rto={:?} cwnd={} ssthresh={}",
+                            rto, self.sender.cwnd(), self.sender.ssthresh()
+                        );
+                    }
                 }
             }
         }
@@ -250,11 +305,11 @@ impl GbnConnection {
 
             // Piggybacked ACK: slide window, update RTT and congestion control.
             if h.flags & flags::ACK != 0 {
-                let n = self.on_ack_received(h.ack);
+                let n = self.on_ack_received(h.ack, h.window);
                 if n > 0 {
                     log::debug!(
-                        "[gbn] ← ACK ack={} slid={} srtt={:?} rto={:?}",
-                        h.ack, n, self.rtt.srtt(), self.rtt.rto()
+                        "[gbn] ← ACK ack={} slid={} srtt={:?} rto={:?} peer_rwnd={}",
+                        h.ack, n, self.rtt.srtt(), self.rtt.rto(), self.sender.peer_rwnd()
                     );
                 }
                 // Reno fast retransmit on 3 consecutive duplicate ACKs.
@@ -316,15 +371,21 @@ impl GbnConnection {
                     if retries > MAX_RETRIES {
                         return Err(ConnError::MaxRetriesExceeded);
                     }
-                    self.retransmit_window().await?;
-                    self.sender.on_retransmit();
-                    self.sender.on_timeout_cc();
-                    self.rtt.back_off();
-                    rto = self.rtt.rto();
-                    log::debug!(
-                        "[gbn] flush timeout — back-off rto={:?} cwnd={} ssthresh={}",
-                        rto, self.sender.cwnd(), self.sender.ssthresh()
-                    );
+                    if self.sender.peer_rwnd() == 0 {
+                        self.probe_zero_window().await?;
+                        rto = (rto * 2).min(Duration::from_secs(64));
+                        log::debug!("[gbn] flush zero-window probe — rto={:?}", rto);
+                    } else {
+                        self.retransmit_window().await?;
+                        self.sender.on_retransmit();
+                        self.sender.on_timeout_cc();
+                        self.rtt.back_off();
+                        rto = self.rtt.rto();
+                        log::debug!(
+                            "[gbn] flush timeout — back-off rto={:?} cwnd={} ssthresh={}",
+                            rto, self.sender.cwnd(), self.sender.ssthresh()
+                        );
+                    }
                 }
             }
         }
@@ -417,15 +478,18 @@ impl GbnConnection {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Process a cumulative ACK: slide the window, update RTT and congestion
-    /// control.  Returns the number of newly-acked segments so callers know
-    /// whether the window has opened.
+    /// Process a cumulative ACK: slide the window, update peer rwnd, RTT, and
+    /// congestion control.  Returns the number of newly-acked segments so
+    /// callers know whether the window has opened.
     ///
     /// This centralises all ACK handling so that every code path — `send`,
-    /// `flush`, `recv`, and the event loop — updates the RTT estimator and
-    /// the Reno congestion window.
-    fn on_ack_received(&mut self, ack_num: u32) -> usize {
+    /// `flush`, `recv`, and the event loop — updates the flow-control state,
+    /// the RTT estimator, and the Reno congestion window.
+    fn on_ack_received(&mut self, ack_num: u32, peer_rwnd: u16) -> usize {
         let AckResult { acked_count, rtt_sample, dup_ack: _ } = self.sender.on_ack(ack_num);
+        // Always update the peer's advertised receive window, even for dup-ACKs,
+        // because the window field in the ACK reflects the peer's current buffer.
+        self.sender.update_peer_rwnd(peer_rwnd);
         if let Some(sample) = rtt_sample {
             self.rtt.record_sample(sample);
             log::debug!(
@@ -439,13 +503,36 @@ impl GbnConnection {
         if acked_count > 0 {
             self.sender.on_ack_cc(acked_count);
             log::debug!(
-                "[gbn] cwnd={} ssthresh={} state={:?}",
+                "[gbn] cwnd={} ssthresh={} peer_rwnd={} state={:?}",
                 self.sender.cwnd(),
                 self.sender.ssthresh(),
+                self.sender.peer_rwnd(),
                 self.sender.cc_state()
             );
         }
         acked_count
+    }
+
+    /// Send a zero-window probe to elicit an updated `rwnd` from the peer.
+    ///
+    /// Called when the send timeout fires but `peer_rwnd == 0` (a flow-control
+    /// stall rather than congestion).  Retransmitting data causes the peer to
+    /// respond with a fresh ACK that carries its current buffer size.
+    ///
+    /// When there are no in-flight segments (the last batch was ACKed just as
+    /// the peer's buffer filled) a pure ACK is sent instead; this keeps the
+    /// peer's socket alive and may prompt it to re-advertise its window.
+    async fn probe_zero_window(&self) -> Result<(), ConnError> {
+        if let Some(pkt) = self.sender.window_entries().next().map(|e| e.packet.clone()) {
+            log::debug!("[gbn] zero-window probe seq={}", pkt.header.seq);
+            self.socket.send_to(&pkt, self.peer).await?;
+        } else {
+            // No unacked segments — send a pure ACK as a keepalive probe.
+            let ack = self.make_ack_pkt();
+            log::debug!("[gbn] zero-window keepalive (empty window)");
+            self.socket.send_to(&ack, self.peer).await?;
+        }
+        Ok(())
     }
 
     /// Retransmit only the oldest unacked segment (Reno fast retransmit).
@@ -495,7 +582,7 @@ impl GbnConnection {
         }
 
         if h.flags & flags::ACK != 0 {
-            let newly_acked = self.on_ack_received(h.ack);
+            let newly_acked = self.on_ack_received(h.ack, h.window);
             window_advanced = newly_acked > 0;
 
             // Reno fast retransmit: 3 consecutive duplicate ACKs signal loss.
@@ -675,9 +762,11 @@ async fn event_loop(
                     break;
                 }
 
-                // Cumulative ACK — slide window, update RTT estimator, Reno CC.
+                // Cumulative ACK — slide window, update peer rwnd, RTT estimator, Reno CC.
                 if h.flags & flags::ACK != 0 {
                     let AckResult { acked_count, rtt_sample, dup_ack } = sender.on_ack(h.ack);
+                    // Update peer's advertised receive window on every ACK.
+                    sender.update_peer_rwnd(h.window);
                     if let Some(sample) = rtt_sample {
                         rtt.record_sample(sample);
                         log::debug!(
@@ -691,8 +780,8 @@ async fn event_loop(
                         retries = 0;
                         rto = rtt.rto();
                         log::debug!(
-                            "[gbn:loop] ← ACK ack={} slid={} rto={:?} cwnd={} ssthresh={}",
-                            h.ack, acked_count, rto, sender.cwnd(), sender.ssthresh()
+                            "[gbn:loop] ← ACK ack={} slid={} rto={:?} cwnd={} ssthresh={} peer_rwnd={}",
+                            h.ack, acked_count, rto, sender.cwnd(), sender.ssthresh(), sender.peer_rwnd()
                         );
 
                         if sender.has_unacked() {
@@ -743,27 +832,37 @@ async fn event_loop(
                     break;
                 }
 
-                // Go-Back-N: retransmit every unacked segment.
-                let pkts: Vec<Packet> = sender.window_entries()
-                    .map(|e| e.packet.clone())
-                    .collect();
-                log::debug!("[gbn:loop] timeout — retransmitting {} pkt(s)", pkts.len());
-                for p in pkts {
-                    let _ = socket.send_to(&p, peer).await;
+                if sender.peer_rwnd() == 0 {
+                    // Flow-control stall: probe the peer for an rwnd update.
+                    if let Some(pkt) = sender.window_entries().next().map(|e| e.packet.clone()) {
+                        log::debug!("[gbn:loop] zero-window probe seq={}", pkt.header.seq);
+                        let _ = socket.send_to(&pkt, peer).await;
+                    }
+                    rto = (rto * 2).min(Duration::from_secs(64));
+                    log::debug!("[gbn:loop] zero-window probe — rto={:?}", rto);
+                } else {
+                    // Go-Back-N: retransmit every unacked segment.
+                    let pkts: Vec<Packet> = sender.window_entries()
+                        .map(|e| e.packet.clone())
+                        .collect();
+                    log::debug!("[gbn:loop] timeout — retransmitting {} pkt(s)", pkts.len());
+                    for p in pkts {
+                        let _ = socket.send_to(&p, peer).await;
+                    }
+                    sender.on_retransmit();
+
+                    // Reno: halve ssthresh, reset cwnd to 1, re-enter slow start.
+                    sender.on_timeout_cc();
+
+                    // Exponential back-off via the RTT estimator.
+                    rtt.back_off();
+                    rto = rtt.rto();
+                    log::debug!(
+                        "[gbn:loop] timeout → SS rto={:?} cwnd={} ssthresh={}",
+                        rto, sender.cwnd(), sender.ssthresh()
+                    );
                 }
-                sender.on_retransmit();
-
-                // Reno: halve ssthresh, reset cwnd to 1, re-enter slow start.
-                sender.on_timeout_cc();
-
-                // Exponential back-off via the RTT estimator.
-                rtt.back_off();
-                rto = rtt.rto();
                 timer.as_mut().reset(tok_now() + rto);
-                log::debug!(
-                    "[gbn:loop] timeout → SS rto={:?} cwnd={} ssthresh={}",
-                    rto, sender.cwnd(), sender.ssthresh()
-                );
             }
         }
     }
