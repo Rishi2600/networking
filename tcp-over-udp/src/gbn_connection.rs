@@ -1,4 +1,4 @@
-//! Go-Back-N connection: handshake + GBN data transfer + concurrent session.
+//! Go-Back-N connection: handshake + GBN data transfer + adaptive RTO.
 //!
 //! # Architecture
 //!
@@ -10,10 +10,25 @@
 //!      │                               │  recv_rx (channel)  │
 //!      ▼                               └──────────┬──────────┘
 //!  GbnConnection                                  │ event_loop task
-//!    ├── GbnSender   (sliding window, seq nums)   │
-//!    ├── GbnReceiver (cumulative ACKs, app buf)   │
-//!    └── Arc<Socket> (shared with background task)┘
+//!    ├── GbnSender    (sliding window, seq nums)  │
+//!    ├── GbnReceiver  (cumulative ACKs, app buf)  │
+//!    ├── RttEstimator (adaptive RTO via RFC 6298) │
+//!    └── Arc<Socket>  (shared with background task)┘
 //! ```
+//!
+//! # RTT estimation
+//!
+//! Every ACK is routed through [`GbnConnection::on_ack_received`], which:
+//!
+//! 1. Calls [`GbnSender::on_ack`] to slide the window and optionally obtain
+//!    a raw RTT sample (via [`AckResult::rtt_sample`]).
+//! 2. If the sample is `Some` (segment was never retransmitted — Karn's
+//!    algorithm is enforced inside `GbnSender`), feeds it into
+//!    [`RttEstimator::record_sample`].
+//! 3. On timeout, calls [`RttEstimator::back_off`] to double the RTO.
+//!
+//! The retransmit timer uses `rtt.rto()` instead of a fixed constant,
+//! so it shrinks as the estimator observes short round trips.
 //!
 //! # Two usage modes
 //!
@@ -29,24 +44,13 @@
 //! ```ignore
 //! let mut session = GbnConnection::connect(socket, peer, 4).await?.run();
 //! session.send_tx.send(b"msg1".to_vec()).await.unwrap();
-//! session.send_tx.send(b"msg2".to_vec()).await.unwrap();
 //! let data = session.recv().await?;
-//! session.close().await?;
-//! ```
-//!
-//! # Integration with the existing handshake
-//!
-//! Use [`Connection::connect`] / [`Connection::accept`] for the 3-way
-//! handshake (they are already well-tested), then convert the result:
-//!
-//! ```ignore
-//! let conn = Connection::connect(socket, peer).await?;
-//! let mut gbn = GbnConnection::from_connection(conn, window_size);
+//! session.close().await;
 //! ```
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -54,28 +58,24 @@ use tokio::time::timeout;
 
 use crate::connection::{ConnError, Connection};
 use crate::gbn_receiver::GbnReceiver;
-use crate::gbn_sender::GbnSender;
+use crate::gbn_sender::{AckResult, GbnSender};
 use crate::packet::{flags, Header, Packet};
+use crate::rtt::RttEstimator;
 use crate::socket::Socket;
 use crate::state::ConnectionState;
 
 // ---------------------------------------------------------------------------
-// Constants (mirror connection.rs)
+// Constants
 // ---------------------------------------------------------------------------
 
-const INITIAL_RTO: Duration = Duration::from_millis(1000);
-const MAX_RTO: Duration = Duration::from_secs(60);
 const MAX_RETRIES: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // GbnConnection
 // ---------------------------------------------------------------------------
 
-/// A reliable connection using Go-Back-N sliding-window flow control.
-///
-/// Obtain one via [`GbnConnection::connect`], [`GbnConnection::accept`], or
-/// [`GbnConnection::from_connection`] (after completing the 3-way handshake
-/// with the existing [`Connection`] API).
+/// A reliable connection using Go-Back-N sliding-window flow control with
+/// adaptive retransmission timeout.
 pub struct GbnConnection {
     /// Current FSM state.
     pub state: ConnectionState,
@@ -86,14 +86,19 @@ pub struct GbnConnection {
     /// Inbound state (cumulative ACKs, application buffer).
     pub receiver: GbnReceiver,
 
-    /// Shared UDP socket.  `Arc` allows handing a clone to the event loop.
+    /// RFC 6298 RTT estimator — tracks SRTT, RTTVAR, and the current RTO.
+    ///
+    /// Inspect after exchanges to observe how the RTO has adapted:
+    /// ```ignore
+    /// println!("SRTT={:?}  RTO={:?}", conn.rtt.srtt(), conn.rtt.rto());
+    /// ```
+    pub rtt: RttEstimator,
+
+    /// Shared UDP socket.  `Arc` lets a clone be handed to the event loop.
     socket: Arc<Socket>,
 
     /// Remote peer address.
     peer: SocketAddr,
-
-    /// Baseline RTO (reset to this after a successful ACK).
-    rto: Duration,
 }
 
 impl GbnConnection {
@@ -104,22 +109,21 @@ impl GbnConnection {
     /// Build a [`GbnConnection`] from an already-established [`Connection`].
     ///
     /// The 3-way handshake must be complete.  `window_size` sets the GBN
-    /// window (N); typical values are 4–16.
+    /// window N.  A fresh [`RttEstimator`] is started — RTT history from
+    /// the handshake is not carried over.
     pub fn from_connection(conn: Connection, window_size: usize) -> Self {
-        let (state, socket, peer, next_seq, rcv_nxt, rto) = conn.into_parts();
+        let (state, socket, peer, next_seq, rcv_nxt, _rto) = conn.into_parts();
         Self {
             state,
             socket: Arc::new(socket),
             peer,
             sender: GbnSender::new(next_seq, window_size),
             receiver: GbnReceiver::new(rcv_nxt),
-            rto,
+            rtt: RttEstimator::new(),
         }
     }
 
-    /// Perform an active open (client) and return a GBN-ready connection.
-    ///
-    /// Equivalent to `Connection::connect` followed by `from_connection`.
+    /// Active open (client): run the 3-way handshake then return a GBN connection.
     pub async fn connect(
         socket: Socket,
         peer: SocketAddr,
@@ -129,9 +133,7 @@ impl GbnConnection {
         Ok(Self::from_connection(conn, window_size))
     }
 
-    /// Perform a passive open (server) and return a GBN-ready connection.
-    ///
-    /// Equivalent to `Connection::accept` followed by `from_connection`.
+    /// Passive open (server): accept one incoming connection and return GBN.
     pub async fn accept(socket: Socket, window_size: usize) -> Result<Self, ConnError> {
         let conn = Connection::accept(socket).await?;
         Ok(Self::from_connection(conn, window_size))
@@ -141,24 +143,24 @@ impl GbnConnection {
     // Sequential data transfer
     // -----------------------------------------------------------------------
 
-    /// Queue one segment for delivery using Go-Back-N.
+    /// Queue one segment for delivery.
     ///
-    /// If the window has space the segment is sent immediately and the call
-    /// returns.  If the window is full the call blocks until an ACK arrives
-    /// (or a timeout triggers a full retransmit) to make room.
+    /// Returns immediately when the window has space.  Blocks — processing
+    /// incoming ACKs and retransmitting on timeout — when the window is full.
     ///
-    /// This enables **pipelining**: successive `send` calls fill the window
-    /// without waiting for individual acknowledgements.  Call [`flush`] after
-    /// all sends to guarantee delivery.
+    /// **Pipeline pattern**: call `send` in a tight loop to fill the window,
+    /// then call [`flush`] to wait for all in-flight segments to be ACKed.
+    ///
+    /// [`flush`]: Self::flush
     pub async fn send(&mut self, data: &[u8]) -> Result<(), ConnError> {
         if self.state != ConnectionState::Established {
             return Err(ConnError::BadState);
         }
 
-        let mut rto = self.rto;
+        let mut rto = self.rtt.rto();
         let mut retries = 0u32;
 
-        // Block until the window has room.
+        // Wait until the window has room, processing inbound packets meanwhile.
         while !self.sender.can_send() {
             let sleep = tokio::time::sleep(rto);
             tokio::pin!(sleep);
@@ -169,7 +171,8 @@ impl GbnConnection {
                     match self.process_incoming(pkt, addr).await {
                         Ok(window_advanced) => {
                             if window_advanced {
-                                rto = self.rto;
+                                // RTT estimator already updated in process_incoming.
+                                rto = self.rtt.rto();
                                 retries = 0;
                             }
                         }
@@ -183,7 +186,9 @@ impl GbnConnection {
                     }
                     self.retransmit_window().await?;
                     self.sender.on_retransmit();
-                    rto = (rto * 2).min(MAX_RTO);
+                    self.rtt.back_off();
+                    rto = self.rtt.rto();
+                    log::debug!("[gbn] timeout — back-off rto={:?}", rto);
                 }
             }
         }
@@ -208,19 +213,11 @@ impl GbnConnection {
     /// Receive the next in-order data chunk from the peer.
     ///
     /// Blocks until a valid in-order segment arrives.  Out-of-order segments
-    /// are re-ACKed with the current cumulative ACK and discarded (GBN
-    /// semantics).  Returns [`ConnError::Eof`] when the peer sends FIN.
+    /// are re-ACKed with the cumulative ACK and discarded (GBN semantics).
+    /// Piggybacked ACKs are fed into the RTT estimator as they arrive.
+    /// Returns [`ConnError::Eof`] on FIN.
     pub async fn recv(&mut self) -> Result<Vec<u8>, ConnError> {
-        if self.state != ConnectionState::Established
-            && self.state != ConnectionState::CloseWait
-        {
-            // Still allow reads in CloseWait (data may have arrived before FIN).
-            if self.state != ConnectionState::CloseWait {
-                return Err(ConnError::BadState);
-            }
-        }
-
-        // Drain any data already buffered from previous receive cycles.
+        // Drain previously buffered data first.
         if !self.receiver.app_buffer.is_empty() {
             return Ok(self.drain_app_buffer());
         }
@@ -247,11 +244,14 @@ impl GbnConnection {
                 return Err(ConnError::Eof);
             }
 
-            // Piggybacked ACK — slide our send window.
+            // Piggybacked ACK: slide window and update RTT estimator.
             if h.flags & flags::ACK != 0 {
-                let n = self.sender.on_ack(h.ack);
+                let n = self.on_ack_received(h.ack);
                 if n > 0 {
-                    log::debug!("[gbn] ← ACK ack={} (slid {} seg)", h.ack, n);
+                    log::debug!(
+                        "[gbn] ← ACK ack={} slid={} srtt={:?} rto={:?}",
+                        h.ack, n, self.rtt.srtt(), self.rtt.rto()
+                    );
                 }
             }
 
@@ -273,16 +273,15 @@ impl GbnConnection {
             if accepted {
                 return Ok(self.drain_app_buffer());
             }
-            // Out-of-order: cumulative ACK sent above; keep waiting.
         }
     }
 
-    /// Wait for all in-flight segments to be acknowledged.
+    /// Drain the send window: block until all in-flight segments are ACKed.
     ///
-    /// After `flush` returns `Ok(())` the send window is empty and all data
-    /// passed to previous [`send`] calls has been confirmed by the peer.
+    /// Uses the adaptive RTO for timeouts; performs Go-Back-N retransmit on
+    /// each expiry and doubles the RTO (exponential back-off).
     pub async fn flush(&mut self) -> Result<(), ConnError> {
-        let mut rto = self.rto;
+        let mut rto = self.rtt.rto();
         let mut retries = 0u32;
 
         while self.sender.has_unacked() {
@@ -295,11 +294,11 @@ impl GbnConnection {
                     match self.process_incoming(pkt, addr).await {
                         Ok(window_advanced) => {
                             if window_advanced {
-                                rto = self.rto;
+                                rto = self.rtt.rto();
                                 retries = 0;
                             }
                         }
-                        Err(ConnError::Eof) => break, // peer closed; stop flushing
+                        Err(ConnError::Eof) => break,
                         Err(e) => return Err(e),
                     }
                 }
@@ -310,24 +309,22 @@ impl GbnConnection {
                     }
                     self.retransmit_window().await?;
                     self.sender.on_retransmit();
-                    rto = (rto * 2).min(MAX_RTO);
+                    self.rtt.back_off();
+                    rto = self.rtt.rto();
+                    log::debug!("[gbn] flush timeout — back-off rto={:?}", rto);
                 }
             }
         }
 
-        if !self.sender.has_unacked() {
-            self.rto = INITIAL_RTO; // reset after clean flush
-        }
         Ok(())
     }
 
-    /// Graceful connection close: flush in-flight data, then send FIN.
+    /// Graceful close: flush pending data, then exchange FIN/ACK.
     pub async fn close(&mut self) -> Result<(), ConnError> {
         if matches!(self.state, ConnectionState::Closed) {
             return Ok(());
         }
 
-        // Ensure all queued data is delivered first.
         match self.flush().await {
             Ok(()) | Err(ConnError::Eof) => {}
             Err(e) => return Err(e),
@@ -343,7 +340,7 @@ impl GbnConnection {
             },
             payload: vec![],
         };
-        let mut rto = self.rto;
+        let mut rto = self.rtt.rto();
 
         for _attempt in 0..=MAX_RETRIES {
             self.socket.send_to(&fin, self.peer).await?;
@@ -362,7 +359,10 @@ impl GbnConnection {
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => return Err(ConnError::Socket(e)),
-                Err(_elapsed) => rto = (rto * 2).min(MAX_RTO),
+                Err(_elapsed) => {
+                    self.rtt.back_off();
+                    rto = self.rtt.rto();
+                }
             }
         }
 
@@ -378,15 +378,7 @@ impl GbnConnection {
     /// Spawn a background event loop and return a [`GbnSession`] handle.
     ///
     /// The event loop multiplexes outbound data (from `send_tx`), inbound
-    /// packets, and retransmit timeouts with `tokio::select!`.  The
-    /// application interacts via channel operations on the returned
-    /// [`GbnSession`].
-    ///
-    /// # Shutdown
-    ///
-    /// Drop (or close) `send_tx` to signal end-of-stream; the event loop will
-    /// send FIN and terminate.  Await [`GbnSession::close`] to wait for the
-    /// loop to finish.
+    /// packets, and adaptive retransmit timeouts with `tokio::select!`.
     pub fn run(self) -> GbnSession {
         let (send_tx, send_rx) = mpsc::channel::<Vec<u8>>(64);
         let (recv_tx, recv_rx) = mpsc::channel::<Result<Vec<u8>, ConnError>>(64);
@@ -396,7 +388,7 @@ impl GbnConnection {
             self.peer,
             self.sender,
             self.receiver,
-            self.rto,
+            self.rtt,
             send_rx,
             recv_tx,
         ));
@@ -412,46 +404,31 @@ impl GbnConnection {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Build a pure ACK packet reflecting the current send/receive state.
-    fn make_ack_pkt(&self) -> Packet {
-        Packet {
-            header: Header {
-                seq: self.sender.next_seq,
-                ack: self.receiver.ack_number(),
-                flags: flags::ACK,
-                window: self.receiver.window_size(),
-                checksum: 0,
-            },
-            payload: vec![],
-        }
-    }
-
-    /// Drain the receiver's application buffer into an owned `Vec`.
-    fn drain_app_buffer(&mut self) -> Vec<u8> {
-        let mut buf = vec![0u8; self.receiver.app_buffer.len()];
-        let n = self.receiver.read(&mut buf);
-        buf.truncate(n);
-        buf
-    }
-
-    /// Retransmit every in-flight segment (Go-Back-N step).
-    async fn retransmit_window(&self) -> Result<(), ConnError> {
-        let pkts: Vec<Packet> = self
-            .sender
-            .window_entries()
-            .map(|e| e.packet.clone())
-            .collect();
-        log::debug!("[gbn] timeout — retransmitting {} segment(s)", pkts.len());
-        for pkt in pkts {
-            self.socket.send_to(&pkt, self.peer).await?;
-        }
-        Ok(())
-    }
-
-    /// Handle an inbound packet: process ACK, data, FIN/RST.
+    /// Process a cumulative ACK: slide the window and feed the RTT sample
+    /// (if any) into the estimator.  Returns the number of newly-acked
+    /// segments so callers know whether the window has opened.
     ///
-    /// Returns `Ok(true)` when the send window advanced (new ACKs), so the
-    /// caller knows it may be able to send more.
+    /// This centralises all ACK handling so that every code path — `send`,
+    /// `flush`, `recv`, and the event loop — updates the RTT estimator.
+    fn on_ack_received(&mut self, ack_num: u32) -> usize {
+        let AckResult { acked_count, rtt_sample } = self.sender.on_ack(ack_num);
+        if let Some(sample) = rtt_sample {
+            self.rtt.record_sample(sample);
+            log::debug!(
+                "[gbn] RTT sample={:?} srtt={:?} rttvar={:?} rto={:?}",
+                sample,
+                self.rtt.srtt(),
+                self.rtt.rttvar(),
+                self.rtt.rto()
+            );
+        }
+        acked_count
+    }
+
+    /// Handle one incoming packet: dispatch ACK, data payload, FIN, RST.
+    ///
+    /// Returns `Ok(true)` when the send window advanced (useful for callers
+    /// waiting to send more data).
     async fn process_incoming(
         &mut self,
         pkt: Packet,
@@ -478,7 +455,7 @@ impl GbnConnection {
         }
 
         if h.flags & flags::ACK != 0 {
-            let newly_acked = self.sender.on_ack(h.ack);
+            let newly_acked = self.on_ack_received(h.ack);
             window_advanced = newly_acked > 0;
         }
 
@@ -497,6 +474,39 @@ impl GbnConnection {
 
         Ok(window_advanced)
     }
+
+    fn make_ack_pkt(&self) -> Packet {
+        Packet {
+            header: Header {
+                seq: self.sender.next_seq,
+                ack: self.receiver.ack_number(),
+                flags: flags::ACK,
+                window: self.receiver.window_size(),
+                checksum: 0,
+            },
+            payload: vec![],
+        }
+    }
+
+    fn drain_app_buffer(&mut self) -> Vec<u8> {
+        let mut buf = vec![0u8; self.receiver.app_buffer.len()];
+        let n = self.receiver.read(&mut buf);
+        buf.truncate(n);
+        buf
+    }
+
+    async fn retransmit_window(&self) -> Result<(), ConnError> {
+        let pkts: Vec<Packet> = self
+            .sender
+            .window_entries()
+            .map(|e| e.packet.clone())
+            .collect();
+        log::debug!("[gbn] retransmitting {} segment(s)", pkts.len());
+        for pkt in pkts {
+            self.socket.send_to(&pkt, self.peer).await?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +515,7 @@ impl GbnConnection {
 
 /// Handle returned by [`GbnConnection::run`] for concurrent send/receive.
 pub struct GbnSession {
-    /// Send data to the remote peer (push `Vec<u8>` into this).
+    /// Send data to the remote peer.
     pub send_tx: mpsc::Sender<Vec<u8>>,
 
     /// Receive data from the remote peer.
@@ -515,27 +525,18 @@ pub struct GbnSession {
 }
 
 impl GbnSession {
-    /// Send a payload to the peer (non-blocking when channel has capacity).
+    /// Push a payload to the peer (non-blocking when channel has capacity).
     pub async fn send(&self, data: Vec<u8>) -> Result<(), ConnError> {
-        self.send_tx
-            .send(data)
-            .await
-            .map_err(|_| ConnError::Reset) // channel closed means event loop died
+        self.send_tx.send(data).await.map_err(|_| ConnError::Reset)
     }
 
-    /// Receive the next chunk of data delivered by the peer.
-    ///
-    /// Returns [`ConnError::Eof`] when the peer closes the connection.
+    /// Pull the next chunk from the peer.  Returns [`ConnError::Eof`] on close.
     pub async fn recv(&mut self) -> Result<Vec<u8>, ConnError> {
-        self.recv_rx
-            .recv()
-            .await
-            .unwrap_or(Err(ConnError::Eof))
+        self.recv_rx.recv().await.unwrap_or(Err(ConnError::Eof))
     }
 
-    /// Signal end-of-stream and wait for the background task to finish.
+    /// Close the session: drop `send_tx` (signals FIN) and await the task.
     pub async fn close(self) {
-        // Dropping send_tx signals the event loop to send FIN and exit.
         drop(self.send_tx);
         let _ = self.handle.await;
     }
@@ -550,15 +551,16 @@ async fn event_loop(
     peer: SocketAddr,
     mut sender: GbnSender,
     mut receiver: GbnReceiver,
-    initial_rto: Duration,
+    mut rtt: RttEstimator,
     mut app_rx: mpsc::Receiver<Vec<u8>>,
     app_tx: mpsc::Sender<Result<Vec<u8>, ConnError>>,
 ) {
-    let mut rto = initial_rto;
+    // Use the estimator's current RTO as the timer interval.
+    let mut rto = rtt.rto();
     let mut retries = 0u32;
 
-    // A "disarmed" timer fires very far in the future.  The `timer_armed`
-    // guard in select! prevents acting on it when the window is empty.
+    // The retransmit timer: "disarmed" means we reset it to a far-future
+    // deadline.  The `timer_armed` guard prevents acting on a disarmed timer.
     let far_future = Duration::from_secs(365 * 24 * 3600);
     let timer = tokio::time::sleep(far_future);
     tokio::pin!(timer);
@@ -566,12 +568,11 @@ async fn event_loop(
 
     loop {
         tokio::select! {
-            // ── Branch 1: new data from the application ──────────────────
-            // Only eligible when the GBN window has space.
+            // ── Branch 1: new data from the application ───────────────────
             maybe_data = app_rx.recv(), if sender.can_send() => {
                 match maybe_data {
                     None => {
-                        // Application closed the send channel → send FIN.
+                        // App closed send_tx → send FIN.
                         let fin = build_fin(&sender, &receiver);
                         let _ = socket.send_to(&fin, peer).await;
                         log::debug!("[gbn:loop] → FIN (app closed)");
@@ -588,7 +589,6 @@ async fn event_loop(
                         }
                         sender.record_sent(pkt);
                         retries = 0;
-                        // Arm the retransmit timer when the first segment enters.
                         if !timer_armed {
                             timer.as_mut().reset(tok_now() + rto);
                             timer_armed = true;
@@ -624,19 +624,28 @@ async fn event_loop(
                     break;
                 }
 
-                // Cumulative ACK — slide the send window.
+                // Cumulative ACK — slide window and update RTT estimator.
                 if h.flags & flags::ACK != 0 {
-                    let newly_acked = sender.on_ack(h.ack);
-                    if newly_acked > 0 {
+                    let AckResult { acked_count, rtt_sample } = sender.on_ack(h.ack);
+                    if let Some(sample) = rtt_sample {
+                        rtt.record_sample(sample);
+                        log::debug!(
+                            "[gbn:loop] RTT sample={:?} srtt={:?} rto={:?}",
+                            sample, rtt.srtt(), rtt.rto()
+                        );
+                    }
+
+                    if acked_count > 0 {
                         retries = 0;
-                        rto = initial_rto;
-                        log::debug!("[gbn:loop] ← ACK ack={} slid={}", h.ack, newly_acked);
+                        rto = rtt.rto(); // use newly estimated RTO
+                        log::debug!(
+                            "[gbn:loop] ← ACK ack={} slid={} rto={:?}",
+                            h.ack, acked_count, rto
+                        );
 
                         if sender.has_unacked() {
-                            // Restart the timer for the new oldest segment.
                             timer.as_mut().reset(tok_now() + rto);
                         } else {
-                            // Window drained — disarm the timer.
                             timer_armed = false;
                             timer.as_mut().reset(tok_now() + far_future);
                         }
@@ -667,7 +676,7 @@ async fn event_loop(
                     break;
                 }
 
-                // Go-Back-N: retransmit every unacked segment from send_base.
+                // Go-Back-N: retransmit every unacked segment.
                 let pkts: Vec<Packet> = sender.window_entries()
                     .map(|e| e.packet.clone())
                     .collect();
@@ -676,15 +685,19 @@ async fn event_loop(
                     let _ = socket.send_to(&p, peer).await;
                 }
                 sender.on_retransmit();
-                rto = (rto * 2).min(MAX_RTO);
+
+                // Exponential back-off via the RTT estimator.
+                rtt.back_off();
+                rto = rtt.rto();
                 timer.as_mut().reset(tok_now() + rto);
+                log::debug!("[gbn:loop] back-off rto={:?}", rto);
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Packet builders (free functions for the event loop)
+// Packet builders
 // ---------------------------------------------------------------------------
 
 fn build_ack(sender: &GbnSender, receiver: &GbnReceiver) -> Packet {
@@ -713,7 +726,6 @@ fn build_fin(sender: &GbnSender, receiver: &GbnReceiver) -> Packet {
     }
 }
 
-/// `tokio::time::Instant::now()` — a convenience alias to avoid the long path.
 #[inline]
 fn tok_now() -> tokio::time::Instant {
     tokio::time::Instant::now()

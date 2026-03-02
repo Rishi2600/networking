@@ -26,6 +26,7 @@
 //! - [`gbn_connection`]  — Go-Back-N sliding-window connection layer
 //! - [`gbn_sender`]      — GBN outbound window state machine
 //! - [`gbn_receiver`]    — GBN inbound cumulative-ACK state machine
+//! - [`rtt`]             — RFC 6298 RTT estimator and adaptive RTO
 //! - [`state`]           — finite-state-machine types
 //! - [`sender`]          — stop-and-wait outbound segment state
 //! - [`receiver`]        — stop-and-wait inbound segment reassembly
@@ -39,6 +40,7 @@ pub mod gbn_receiver;
 pub mod gbn_sender;
 pub mod packet;
 pub mod receiver;
+pub mod rtt;
 pub mod sender;
 pub mod simulator;
 pub mod socket;

@@ -241,14 +241,14 @@ fn test_gbn_sender_window_boundary() {
     assert_eq!(s.in_flight(), 3);
 
     // ACK the first two.
-    let acked = s.on_ack(8); // two 4-byte segments
-    assert_eq!(acked, 2);
+    let r = s.on_ack(8); // two 4-byte segments
+    assert_eq!(r.acked_count, 2);
     assert!(s.can_send(), "one slot should have opened");
     assert_eq!(s.in_flight(), 1);
 
     // ACK the last one.
-    let acked = s.on_ack(12);
-    assert_eq!(acked, 1);
+    let r = s.on_ack(12);
+    assert_eq!(r.acked_count, 1);
     assert!(!s.has_unacked());
 }
 
@@ -328,4 +328,136 @@ async fn test_gbn_flush_delivers_all() {
     let total = sr.unwrap();
     cr.unwrap();
     assert_eq!(total, MSG_COUNT * 4);
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: RTT estimator adapts — RTO falls below initial 1 s after exchanges
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_rtt_adapts_on_loopback() {
+    // After a handful of loopback ping-pongs the RTT estimator should observe
+    // sub-millisecond RTTs and reduce the RTO well below its 1 s initial value.
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    const ROUNDS: usize = 8;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, 4)
+            .await
+            .expect("accept");
+        for _ in 0..ROUNDS {
+            match conn.recv().await {
+                Ok(data) => conn.send(&data).await.expect("echo"),
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        conn.close().await.ok();
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, 4)
+            .await
+            .expect("connect");
+
+        for i in 0..ROUNDS {
+            let msg = format!("rtt-probe-{i}");
+            conn.send(msg.as_bytes()).await.expect("send");
+            conn.recv().await.expect("recv");
+        }
+
+        // After ROUNDS loopback echoes the RTO must be significantly below 1 s.
+        let rto = conn.rtt.rto();
+        assert!(
+            rto < std::time::Duration::from_millis(500),
+            "RTO should have adapted below 500 ms after loopback; got {rto:?}"
+        );
+        // SRTT must be present and tiny.
+        let srtt = conn.rtt.srtt().expect("SRTT must be set after exchanges");
+        assert!(
+            srtt < std::time::Duration::from_millis(100),
+            "SRTT should be near-zero on loopback; got {srtt:?}"
+        );
+
+        conn.close().await.ok();
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    sr.unwrap();
+    cr.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Karn's algorithm — retransmit does not poison SRTT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_karn_retransmit_no_sample() {
+    use tcp_over_udp::gbn_sender::GbnSender;
+
+    let mut s = GbnSender::new(0, 2);
+
+    // Send two segments.
+    let p1 = s.build_data_packet(vec![1u8; 8], 0, 8192);
+    s.record_sent(p1);
+    let p2 = s.build_data_packet(vec![2u8; 8], 0, 8192);
+    s.record_sent(p2);
+
+    // Simulate a timeout: both are retransmitted → tx_count becomes 2.
+    s.on_retransmit();
+    assert_eq!(s.window_entries().next().unwrap().tx_count, 2);
+
+    // ACK for both: oldest was retransmitted → no RTT sample (Karn's algorithm).
+    let r = s.on_ack(16);
+    assert_eq!(r.acked_count, 2);
+    assert!(
+        r.rtt_sample.is_none(),
+        "retransmitted oldest segment must suppress RTT sample"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: RTT estimator unit — RTO adapts after simulated delay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rtt_estimator_adapts_to_delay() {
+    use std::time::Duration;
+    use tcp_over_udp::rtt::RttEstimator;
+
+    let mut rtt = RttEstimator::new();
+
+    // Feed 10 identical 50 ms samples.
+    for _ in 0..10 {
+        rtt.record_sample(Duration::from_millis(50));
+    }
+
+    let srtt = rtt.srtt().expect("SRTT must be set");
+    // After 10 samples of 50 ms the SRTT should be close to 50 ms.
+    assert!(
+        srtt.as_millis().abs_diff(50) <= 5,
+        "SRTT should ≈ 50 ms, got {srtt:?}"
+    );
+
+    // RTO = SRTT + 4·RTTVAR; with near-zero RTTVAR it should be close to SRTT.
+    let rto = rtt.rto();
+    assert!(
+        rto >= srtt,
+        "RTO must be ≥ SRTT, got rto={rto:?} srtt={srtt:?}"
+    );
+    assert!(
+        rto < Duration::from_millis(500),
+        "RTO should be well below 500 ms after stable 50 ms samples; got {rto:?}"
+    );
+
+    // Feed a sudden spike — RTTVAR should widen and RTO should increase.
+    rtt.record_sample(Duration::from_millis(300));
+    let rto_after_spike = rtt.rto();
+    assert!(
+        rto_after_spike > rto,
+        "RTO must increase after a RTT spike; before={rto:?} after={rto_after_spike:?}"
+    );
 }
