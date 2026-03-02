@@ -611,18 +611,23 @@ async fn event_loop(
     let timer = tokio::time::sleep(far_future);
     tokio::pin!(timer);
     let mut timer_armed = false;
+    // `half_closed` is set when the application drops `send_tx`.  After
+    // sending our FIN we must keep the loop alive to receive — and ACK —
+    // the peer's FIN before exiting.
+    let mut half_closed = false;
 
     loop {
         tokio::select! {
             // ── Branch 1: new data from the application ───────────────────
-            maybe_data = app_rx.recv(), if sender.can_send() => {
+            maybe_data = app_rx.recv(), if sender.can_send() && !half_closed => {
                 match maybe_data {
                     None => {
-                        // App closed send_tx → send FIN.
+                        // App closed send_tx → send FIN, then stay in the
+                        // loop so Branch 2 can receive and ACK the peer's FIN.
                         let fin = build_fin(&sender, &receiver);
                         let _ = socket.send_to(&fin, peer).await;
-                        log::debug!("[gbn:loop] → FIN (app closed)");
-                        break;
+                        log::debug!("[gbn:loop] → FIN (app closed); waiting for peer FIN");
+                        half_closed = true;
                     }
                     Some(payload) => {
                         let pkt = sender.build_data_packet(
