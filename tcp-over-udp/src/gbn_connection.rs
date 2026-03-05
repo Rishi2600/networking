@@ -48,6 +48,7 @@
 //! session.close().await;
 //! ```
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -239,6 +240,28 @@ impl GbnConnection {
         self
     }
 
+    /// Enable or disable Nagle write-coalescing (RFC 896).
+    ///
+    /// When `enabled` is `true`, small writes passed to [`send`] are buffered
+    /// until either the buffer reaches one MSS **or** no data is currently in
+    /// flight.  When `false` (the default), every [`send`] call transmits its
+    /// payload immediately as a separate segment (`TCP_NODELAY` semantics).
+    ///
+    /// **Interaction with other operations:**
+    /// - [`flush`] and [`close`] always force-drain the Nagle buffer before
+    ///   blocking, so no data is ever silently stuck.
+    /// - [`recv`], when called while the Nagle buffer is non-empty, also
+    ///   force-drains it first to prevent request/response deadlock.
+    ///
+    /// [`send`]: Self::send
+    /// [`flush`]: Self::flush
+    /// [`close`]: Self::close
+    /// [`recv`]: Self::recv
+    pub fn with_nagle(mut self, enabled: bool) -> Self {
+        self.sender.set_nagle(enabled);
+        self
+    }
+
     // -----------------------------------------------------------------------
     // Sequential data transfer
     // -----------------------------------------------------------------------
@@ -266,9 +289,21 @@ impl GbnConnection {
             return self.send_segment(data).await;
         }
 
-        // Segment the data into MSS-sized chunks.
-        for chunk in data.chunks(mss) {
-            self.send_segment(chunk).await?;
+        // Push data through the Nagle buffer.
+        //
+        // When Nagle is disabled (default), `nagle_push` returns MSS-sized
+        // chunks immediately — identical to the previous `data.chunks(mss)` loop.
+        // When Nagle is enabled, sub-MSS writes may be held until the pipe
+        // empties or a full segment accumulates.
+        let ready = self.sender.nagle_push(data, mss);
+        for seg in ready {
+            self.send_segment(&seg).await?;
+            // After `send_segment` blocks and returns, ACKs may have been
+            // processed and the pipe may now be empty.  Pump the Nagle buffer
+            // so any coalesced data held while the pipe was busy is released.
+            for more in self.sender.nagle_pump(mss) {
+                self.send_segment(&more).await?;
+            }
         }
         Ok(())
     }
@@ -363,9 +398,22 @@ impl GbnConnection {
     /// Piggybacked ACKs are fed into the RTT estimator as they arrive.
     /// Returns [`ConnError::Eof`] on FIN.
     pub async fn recv(&mut self) -> Result<Vec<u8>, ConnError> {
-        // Drain previously buffered data first.
+        // Drain previously buffered data first (no need to flush Nagle when
+        // there's already data ready to return to the caller).
         if !self.receiver.app_buffer.is_empty() {
             return Ok(self.drain_app_buffer());
+        }
+
+        // About to block waiting for the peer.  Force-drain the Nagle buffer
+        // so the peer receives any pending data before we wait for its reply.
+        // This prevents request/response deadlock when the caller does:
+        //   send(small_request)   → held by Nagle
+        //   recv()                → blocks here, peer never receives request
+        if let Some(buffered) = self.sender.nagle_force_flush() {
+            let mss = self.mss as usize;
+            for chunk in buffered.chunks(mss) {
+                self.send_segment(chunk).await?;
+            }
         }
 
         loop {
@@ -432,6 +480,17 @@ impl GbnConnection {
     /// Uses the adaptive RTO for timeouts; performs Go-Back-N retransmit on
     /// each expiry and doubles the RTO (exponential back-off).
     pub async fn flush(&mut self) -> Result<(), ConnError> {
+        // Force-drain any Nagle-buffered data before waiting for the send
+        // window to drain.  Without this, a caller that writes small chunks
+        // and then calls flush() would block forever if Nagle is holding the
+        // last sub-MSS write.
+        if let Some(buffered) = self.sender.nagle_force_flush() {
+            let mss = self.mss as usize;
+            for chunk in buffered.chunks(mss) {
+                self.send_segment(chunk).await?;
+            }
+        }
+
         let mut rto = self.rtt.rto();
         let mut retries = 0u32;
 
@@ -643,6 +702,7 @@ impl GbnConnection {
             send_rx,
             recv_tx,
             self.msl,
+            self.mss as usize,
         ));
 
         GbnSession {
@@ -1021,6 +1081,7 @@ async fn event_loop(
     mut app_rx: mpsc::Receiver<Vec<u8>>,
     app_tx: mpsc::Sender<Result<Vec<u8>, ConnError>>,
     msl: Duration,
+    mss: usize,
 ) {
     let mut rto = rtt.rto();
     let mut retries = 0u32;
@@ -1041,9 +1102,11 @@ async fn event_loop(
     let persist_tmr = tokio::time::sleep(far_future);
     tokio::pin!(persist_tmr);
 
-    // One-slot staging buffer: holds a segment taken from app_rx when the
-    // send window was shut.  Cleared by the drain phase each iteration.
-    let mut staged: Option<Vec<u8>> = None;
+    // Staging queue: holds segments ready to send when the window is shut
+    // or when Nagle has coalesced multiple writes into a batch.  Replaces
+    // the previous single-slot `Option<Vec<u8>>` so that `nagle_push` can
+    // return multiple segments (e.g. when data > MSS) without losing them.
+    let mut staged: VecDeque<Vec<u8>> = VecDeque::new();
 
     // `fin_pending` becomes true as soon as app_rx returns None (send_tx
     // dropped).  The actual FIN wire packet is sent by the drain phase once
@@ -1069,49 +1132,58 @@ async fn event_loop(
         // branch (ACK opening the window, timer probe) is acted upon
         // immediately without an extra round-trip through select!.
 
-        // 1. Try to send the staged segment if the window has opened.
-        if let Some(data) = staged.take() {
-            if sender.can_send() {
-                let pkt = sender.build_data_packet(
-                    data,
-                    receiver.ack_number(),
-                    receiver.window_size(),
-                );
-                if socket.send_to(&pkt, peer).await.is_err() {
-                    break;
-                }
-                sender.record_sent(pkt);
-                retries = 0;
-                // Arm retransmit timer (persist cannot be active when can_send is true).
-                if !retransmit_armed {
-                    retransmit_tmr.as_mut().reset(tok_now() + rto);
-                    retransmit_armed = true;
-                }
-                log::debug!("[gbn:loop] staged → DATA in_flight={}", sender.in_flight());
-            } else {
-                // Window still shut — put the segment back.
-                // Arm whichever timer is relevant for the stall cause.
-                staged = Some(data);
+        // 1. Try to drain staged segments into the send window.
+        //    Loop so that multiple segments produced by nagle_push can all
+        //    be dispatched in one drain phase if the window permits.
+        while !staged.is_empty() {
+            if !sender.can_send() {
+                // Window shut — leave the rest in the queue and arm the
+                // appropriate stall timer.
                 if sender.persist.is_active() {
-                    // Zero-window stall: the persist timer drives probing.
                     persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
                 } else if !retransmit_armed {
-                    // Congestion/count stall: retransmit timer handles it.
                     retransmit_tmr.as_mut().reset(tok_now() + rto);
                     retransmit_armed = true;
                 }
+                break;
             }
+            let data = staged.pop_front().unwrap();
+            let pkt = sender.build_data_packet(
+                data,
+                receiver.ack_number(),
+                receiver.window_size(),
+            );
+            if socket.send_to(&pkt, peer).await.is_err() {
+                break;
+            }
+            sender.record_sent(pkt);
+            retries = 0;
+            // Arm retransmit timer (persist cannot be active when can_send is true).
+            if !retransmit_armed {
+                retransmit_tmr.as_mut().reset(tok_now() + rto);
+                retransmit_armed = true;
+            }
+            log::debug!("[gbn:loop] staged → DATA in_flight={}", sender.in_flight());
         }
 
-        // 2. Send our FIN once: app closed + staging slot empty + window drained.
+        // 2. Send our FIN once: app closed + staging queue empty + window drained.
         //    Decoupling FIN from can_send() is the whole point of this
         //    restructure: FIN is a lifecycle event, not a data segment.
-        if fin_pending && !half_closed && staged.is_none() && !sender.has_unacked() {
-            let fin = build_fin(&sender, &receiver);
-            fin_seq = fin.header.seq;  // Save for ACK-of-FIN detection below.
-            let _ = socket.send_to(&fin, peer).await;
-            log::debug!("[gbn:loop] → FIN seq={} (data drained); waiting for peer FIN", fin_seq);
-            half_closed = true;
+        //    Also force-drain the Nagle buffer so held data is sent before FIN.
+        if fin_pending && !half_closed && staged.is_empty() && !sender.has_unacked() {
+            // If Nagle is holding any data, flush it into the staging queue
+            // and let the drain phase send it before we emit the FIN.
+            if let Some(buffered) = sender.nagle_force_flush() {
+                staged.push_back(buffered);
+                // Loop again: drain phase will send it, then we reach here with
+                // an empty queue and actually emit the FIN.
+            } else {
+                let fin = build_fin(&sender, &receiver);
+                fin_seq = fin.header.seq; // Save for ACK-of-FIN detection below.
+                let _ = socket.send_to(&fin, peer).await;
+                log::debug!("[gbn:loop] → FIN seq={} (data drained); waiting for peer FIN", fin_seq);
+                half_closed = true;
+            }
         }
 
         // ── Event wait ─────────────────────────────────────────────────────
@@ -1125,38 +1197,21 @@ async fn event_loop(
             // The one-slot `staged` buffer prevents consuming items faster
             // than they can be dispatched while still allowing None to be
             // seen the moment the slot is free.
-            msg = app_rx.recv(), if staged.is_none() && !fin_pending && !half_closed => {
+            // Guard: accept from the channel when the staging queue is empty
+            // so that (a) Nagle can coalesce multiple app writes into the
+            // nagle_buf before the queue fills, and (b) None (send_tx dropped)
+            // is observable as soon as the slot is free.
+            msg = app_rx.recv(), if staged.is_empty() && !fin_pending && !half_closed => {
                 match msg {
                     Some(payload) => {
-                        if sender.can_send() {
-                            // Fast path: window open — send immediately.
-                            let pkt = sender.build_data_packet(
-                                payload,
-                                receiver.ack_number(),
-                                receiver.window_size(),
-                            );
-                            if socket.send_to(&pkt, peer).await.is_err() {
-                                break;
-                            }
-                            sender.record_sent(pkt);
-                            retries = 0;
-                            // Arm retransmit timer (persist cannot be active when can_send is true).
-                            if !retransmit_armed {
-                                retransmit_tmr.as_mut().reset(tok_now() + rto);
-                                retransmit_armed = true;
-                            }
-                            log::debug!("[gbn:loop] → DATA in_flight={}", sender.in_flight());
-                        } else {
-                            // Slow path: window shut — park the segment.
-                            // Arm whichever timer is relevant for the stall cause.
-                            staged = Some(payload);
-                            if sender.persist.is_active() {
-                                persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
-                            } else if !retransmit_armed {
-                                retransmit_tmr.as_mut().reset(tok_now() + rto);
-                                retransmit_armed = true;
-                            }
-                        }
+                        // Push through the Nagle buffer.  When Nagle is disabled
+                        // (default), nagle_push returns MSS-sized chunks immediately.
+                        // When enabled, sub-MSS data may be held until conditions are met.
+                        let ready = sender.nagle_push(&payload, mss);
+                        staged.extend(ready);
+                        // The drain phase at the top of the next iteration sends
+                        // whatever is in `staged`.  We do NOT send inline here so
+                        // that the loop structure stays consistent.
                     }
                     None => {
                         // send_tx dropped.  Queue the FIN; the drain phase at
@@ -1167,7 +1222,7 @@ async fn event_loop(
                             "[gbn:loop] app closed; FIN pending \
                              (in_flight={} staged={})",
                             sender.in_flight(),
-                            staged.is_some()
+                            staged.len()
                         );
                     }
                 }
@@ -1270,6 +1325,13 @@ async fn event_loop(
                             retransmit_armed = false;
                             retransmit_tmr.as_mut().reset(tok_now() + far_future);
                         }
+
+                        // Post-ACK Nagle pump: the pipe may have just emptied,
+                        // releasing data that was held by the Nagle condition.
+                        // Queue any newly-ready segments for the drain phase.
+                        let pumped = sender.nagle_pump(mss);
+                        staged.extend(pumped);
+
                         // The drain phase at the top of the next iteration will
                         // send any staged segment and/or emit FIN if warranted.
                     } else if dup_ack && sender.dup_ack_count() == 3 {

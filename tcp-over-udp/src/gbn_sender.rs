@@ -209,6 +209,28 @@ pub struct GbnSender {
     ///
     /// [`retransmit_oldest`]: Self::retransmit_oldest
     sr_retransmit_count: u64,
+
+    // ── Nagle's algorithm ─────────────────────────────────────────────────
+
+    /// Write-coalescing buffer (RFC 896 Nagle algorithm).
+    ///
+    /// Small writes are appended here.  The buffer is drained into actual
+    /// segments only when the Nagle drain condition is met:
+    ///   - buffer ≥ MSS (full segment ready), **or**
+    ///   - pipe is empty (no unacknowledged segments in flight).
+    ///
+    /// Force-flushed (entire buffer sent regardless) by `flush()`, `recv()`
+    /// (before blocking), and `close()`.
+    nagle_buf: Vec<u8>,
+
+    /// Whether Nagle coalescing is active.
+    ///
+    /// Defaults to `false` (TCP_NODELAY semantics) so that all existing
+    /// tests continue to observe one segment per write, unchanged.
+    /// Opt in via [`set_nagle`].
+    ///
+    /// [`set_nagle`]: Self::set_nagle
+    nagle_enabled: bool,
 }
 
 impl GbnSender {
@@ -234,6 +256,8 @@ impl GbnSender {
             cwnd_ca_counter: 0,
             persist: PersistTimer::new(),
             sr_retransmit_count: 0,
+            nagle_buf: Vec::new(),
+            nagle_enabled: false,
         }
     }
 
@@ -590,6 +614,97 @@ impl GbnSender {
     /// Number of consecutive duplicate ACKs seen since the last new ACK.
     pub fn dup_ack_count(&self) -> u32 {
         self.dup_ack_count
+    }
+
+    // -----------------------------------------------------------------------
+    // Nagle's algorithm
+    // -----------------------------------------------------------------------
+
+    /// Enable or disable Nagle write-coalescing.
+    ///
+    /// When `true`, small writes are held in an internal buffer until either
+    /// the buffer reaches one MSS or the pipe (send window) is empty.  When
+    /// `false` (the default), every write is dispatched immediately as a
+    /// separate segment (`TCP_NODELAY` semantics).
+    pub fn set_nagle(&mut self, enabled: bool) {
+        self.nagle_enabled = enabled;
+    }
+
+    /// Whether Nagle coalescing is currently active.
+    pub fn nagle_enabled(&self) -> bool {
+        self.nagle_enabled
+    }
+
+    /// Bytes currently held in the Nagle buffer.
+    pub fn nagle_pending(&self) -> usize {
+        self.nagle_buf.len()
+    }
+
+    /// Append `data` to the Nagle buffer and return all segments that are
+    /// ready to transmit, each at most `mss` bytes long.
+    ///
+    /// The Nagle drain condition is:
+    /// - buffer ≥ MSS (a full segment is available), **or**
+    /// - pipe is empty (`!has_unacked()`).
+    ///
+    /// When Nagle is disabled, all data is returned immediately (TCP_NODELAY).
+    /// The caller must call [`record_sent`] for each returned segment after
+    /// transmitting it to update the send window and sequence numbers.
+    ///
+    /// [`record_sent`]: Self::record_sent
+    pub fn nagle_push(&mut self, data: &[u8], mss: usize) -> Vec<Vec<u8>> {
+        self.nagle_buf.extend_from_slice(data);
+        self.nagle_drain_ready(mss)
+    }
+
+    /// Drain ready segments from the Nagle buffer **without** adding new data.
+    ///
+    /// Call this after an ACK advances `send_base` and potentially empties
+    /// the pipe, so that any coalesced data held by Nagle is released.
+    pub fn nagle_pump(&mut self, mss: usize) -> Vec<Vec<u8>> {
+        self.nagle_drain_ready(mss)
+    }
+
+    /// Force-drain the entire Nagle buffer regardless of Nagle conditions.
+    ///
+    /// Returns the concatenated buffered bytes, or `None` when empty.
+    /// Use this in `flush()`, `recv()` (before blocking), and `close()` to
+    /// ensure all pending data is transmitted before waiting for ACKs or
+    /// sending a FIN.
+    ///
+    /// The returned bytes may exceed one MSS; the caller must chunk them into
+    /// MSS-sized segments before transmission.
+    pub fn nagle_force_flush(&mut self) -> Option<Vec<u8>> {
+        if self.nagle_buf.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.nagle_buf))
+        }
+    }
+
+    /// Core Nagle drain: emit segments that satisfy the send condition.
+    ///
+    /// Drains full MSS-sized chunks first; the final sub-MSS remainder is
+    /// held when Nagle is enabled and the pipe is non-empty.
+    fn nagle_drain_ready(&mut self, mss: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            if self.nagle_buf.is_empty() {
+                break;
+            }
+            let should_send = if self.nagle_enabled {
+                // RFC 896 Nagle condition.
+                self.nagle_buf.len() >= mss || !self.has_unacked()
+            } else {
+                true // TCP_NODELAY: always send.
+            };
+            if !should_send {
+                break;
+            }
+            let len = self.nagle_buf.len().min(mss);
+            out.push(self.nagle_buf.drain(..len).collect());
+        }
+        out
     }
 }
 
@@ -991,6 +1106,173 @@ mod tests {
 
         assert_eq!(s.cwnd(), 4, "exit FR: cwnd ← ssthresh");
         assert_eq!(*s.cc_state(), CongestionState::CongestionAvoidance);
+    }
+
+    // ── Nagle's algorithm ───────────────────────────────────────────────────
+
+    #[test]
+    fn nagle_disabled_drains_immediately() {
+        let mut s = GbnSender::new(0, 4);
+        assert!(!s.nagle_enabled(), "Nagle must be off by default (TCP_NODELAY)");
+
+        // Even with a segment in flight, TCP_NODELAY drains immediately.
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+        assert!(s.has_unacked());
+
+        let ready = s.nagle_push(b"hi", 1460);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0], b"hi");
+        assert_eq!(s.nagle_pending(), 0, "buffer must be empty after drain");
+    }
+
+    #[test]
+    fn nagle_enabled_holds_small_write_when_pipe_nonempty() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+
+        // Put a segment in flight.
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+        assert!(s.has_unacked());
+
+        let ready = s.nagle_push(b"small", 1460);
+        assert!(ready.is_empty(), "Nagle should hold small write when pipe is non-empty");
+        assert_eq!(s.nagle_pending(), 5);
+    }
+
+    #[test]
+    fn nagle_enabled_sends_when_pipe_empty() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+        assert!(!s.has_unacked(), "pipe must be empty at start");
+
+        let ready = s.nagle_push(b"hello", 1460);
+        assert_eq!(ready.len(), 1, "pipe empty → drain immediately");
+        assert_eq!(&ready[0], b"hello");
+    }
+
+    #[test]
+    fn nagle_enabled_sends_full_segment_even_when_pipe_nonempty() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+
+        // Pipe nonempty.
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+
+        // Write exactly one MSS — should flush even though pipe is non-empty.
+        let data = vec![0xABu8; 100];
+        let ready = s.nagle_push(&data, 100);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].len(), 100);
+        assert_eq!(s.nagle_pending(), 0);
+    }
+
+    #[test]
+    fn nagle_pump_drains_after_ack_empties_pipe() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+
+        // Send a segment → pipe nonempty.
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+
+        // Small write: held by Nagle.
+        let held = s.nagle_push(b"buffered", 1460);
+        assert!(held.is_empty(), "Nagle should hold while pipe is non-empty");
+        assert_eq!(s.nagle_pending(), 8);
+
+        // ACK clears the pipe.
+        s.on_ack(4);
+        assert!(!s.has_unacked(), "pipe must be empty after ACK");
+
+        // Pump: pipe empty → Nagle condition met → drain.
+        let drained = s.nagle_pump(1460);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(&drained[0], b"buffered");
+        assert_eq!(s.nagle_pending(), 0);
+    }
+
+    #[test]
+    fn nagle_coalesces_multiple_small_pushes() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+
+        // Pipe nonempty: segment in flight.
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+
+        // Two sub-MSS pushes; neither alone reaches MSS=6.
+        let r1 = s.nagle_push(b"abc", 6); // 3 bytes < mss=6 → held
+        assert!(r1.is_empty(), "first sub-MSS push should be held");
+        assert_eq!(s.nagle_pending(), 3);
+
+        // Second push: 3+3 = 6 ≥ mss=6 → drain as one coalesced segment.
+        let r2 = s.nagle_push(b"def", 6);
+        assert_eq!(r2.len(), 1, "should produce exactly one coalesced segment");
+        assert_eq!(&r2[0], b"abcdef", "segments should be coalesced");
+        assert_eq!(s.nagle_pending(), 0);
+    }
+
+    #[test]
+    fn nagle_force_flush_releases_held_data() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+
+        // Pipe nonempty.
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+
+        // Two sub-MSS pushes — both held.
+        s.nagle_push(b"part1", 1460);
+        s.nagle_push(b"part2", 1460);
+        assert_eq!(s.nagle_pending(), 10);
+
+        // Force-flush: bypasses Nagle hold, returns all buffered bytes.
+        let flushed = s.nagle_force_flush();
+        assert!(flushed.is_some());
+        assert_eq!(flushed.unwrap(), b"part1part2");
+        assert_eq!(s.nagle_pending(), 0);
+    }
+
+    #[test]
+    fn nagle_force_flush_returns_none_when_empty() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+        assert!(s.nagle_force_flush().is_none());
+    }
+
+    #[test]
+    fn nagle_drains_remainder_after_mss_aligned_chunks() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+        // Pipe is empty → all data drains immediately, even the sub-MSS tail.
+        let data = vec![0u8; 250];
+        let ready = s.nagle_push(&data, 100);
+        // 250 bytes / 100 = 2 full + 50 remainder.  Pipe was empty → all drain.
+        assert_eq!(ready.len(), 3, "pipe empty: all chunks drain, including remainder");
+        assert_eq!(ready[0].len(), 100);
+        assert_eq!(ready[1].len(), 100);
+        assert_eq!(ready[2].len(), 50);
+    }
+
+    #[test]
+    fn nagle_holds_remainder_when_pipe_nonempty() {
+        let mut s = GbnSender::new(0, 4);
+        s.set_nagle(true);
+
+        // Pipe nonempty.
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+
+        // 250 bytes with mss=100: two full chunks drain, 50-byte tail is held.
+        let data = vec![0u8; 250];
+        let ready = s.nagle_push(&data, 100);
+        assert_eq!(ready.len(), 2, "two full MSS chunks should drain");
+        assert_eq!(ready[0].len(), 100);
+        assert_eq!(ready[1].len(), 100);
+        assert_eq!(s.nagle_pending(), 50, "50-byte tail held by Nagle");
     }
 
     #[test]

@@ -1652,3 +1652,183 @@ async fn test_segmentation_respects_mss() {
     .await
     .expect("test_segmentation_respects_mss timed out");
 }
+
+// ---------------------------------------------------------------------------
+// Test 36: Nagle holds small write until flush() drains it
+// ---------------------------------------------------------------------------
+
+/// Verify that with Nagle enabled, a sub-MSS write after a first segment
+/// is held in the buffer and not transmitted until flush() is called.
+/// All data must still arrive at the server in the correct order.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nagle_flush_delivers_all() {
+    use std::time::Duration;
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut gbn = GbnConnection::accept(server_sock, 4)
+            .await
+            .expect("server accept");
+
+        let mut received: Vec<u8> = Vec::new();
+        loop {
+            match gbn.recv().await {
+                Ok(chunk) => received.extend_from_slice(&chunk),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        gbn.close().await.expect("server close");
+        received
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut gbn = GbnConnection::connect(sock, server_addr, 4)
+            .await
+            .expect("client connect")
+            .with_nagle(true);
+
+        // First send: pipe is empty → sent immediately (Nagle allows it).
+        gbn.send(b"first").await.expect("client send 1");
+        // Second send: pipe is non-empty, 6 bytes < DEFAULT_MSS → held by Nagle.
+        gbn.send(b"second").await.expect("client send 2");
+        // flush() force-drains the Nagle buffer before waiting for ACKs.
+        gbn.flush().await.expect("client flush");
+        gbn.close().await.expect("client close");
+    });
+
+    let received = tokio::time::timeout(DEADLINE, async {
+        let (s, c) = tokio::join!(server, client);
+        c.unwrap();
+        s.unwrap()
+    })
+    .await
+    .expect("test_nagle_flush_delivers_all timed out");
+
+    assert_eq!(received, b"firstsecond");
+}
+
+// ---------------------------------------------------------------------------
+// Test 37: Nagle force-drains in recv() to prevent request/response deadlock
+// ---------------------------------------------------------------------------
+
+/// When Nagle is enabled and the client sends a small request then immediately
+/// calls recv(), the Nagle buffer must be force-flushed before blocking so
+/// that the server receives the request and can send its reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nagle_recv_prevents_deadlock() {
+    use std::time::Duration;
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    // Server: receive one request, reply, then close.
+    let server = tokio::spawn(async move {
+        let mut gbn = GbnConnection::accept(server_sock, 4)
+            .await
+            .expect("server accept");
+
+        // Wait for the client's request.
+        let req = gbn.recv().await.expect("server recv request");
+        assert_eq!(req, b"request");
+
+        // Echo back.
+        gbn.send(b"response").await.expect("server send response");
+        // Drain until client closes.
+        loop {
+            match gbn.recv().await {
+                Ok(_) => {}
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        gbn.close().await.expect("server close");
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut gbn = GbnConnection::connect(sock, server_addr, 4)
+            .await
+            .expect("client connect")
+            .with_nagle(true);
+
+        // send() with Nagle enabled: pipe is empty → sent immediately.
+        gbn.send(b"request").await.expect("client send");
+
+        // recv() must force-drain Nagle before blocking so the server
+        // receives the request.  (Without force-drain this would deadlock.)
+        let reply = gbn.recv().await.expect("client recv");
+        assert_eq!(reply, b"response");
+
+        gbn.close().await.expect("client close");
+    });
+
+    tokio::time::timeout(DEADLINE, async {
+        let (s, c) = tokio::join!(server, client);
+        s.unwrap();
+        c.unwrap();
+    })
+    .await
+    .expect("test_nagle_recv_prevents_deadlock timed out");
+}
+
+// ---------------------------------------------------------------------------
+// Test 38: Nagle disabled (default) — each send dispatched immediately
+// ---------------------------------------------------------------------------
+
+/// With Nagle disabled (the default), each send() call dispatches its payload
+/// as a separate segment regardless of pipe state.  All data must arrive.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_nagle_disabled_sends_each_write_immediately() {
+    use std::time::Duration;
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut gbn = GbnConnection::accept(server_sock, 8)
+            .await
+            .expect("server accept");
+
+        let mut received: Vec<u8> = Vec::new();
+        loop {
+            match gbn.recv().await {
+                Ok(chunk) => received.extend_from_slice(&chunk),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        gbn.close().await.expect("server close");
+        received
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        // Nagle is OFF by default (TCP_NODELAY semantics).
+        let mut gbn = GbnConnection::connect(sock, server_addr, 8)
+            .await
+            .expect("client connect");
+
+        for chunk in [b"a".as_slice(), b"bb", b"ccc", b"dddd"] {
+            gbn.send(chunk).await.expect("client send");
+        }
+        gbn.flush().await.expect("client flush");
+        gbn.close().await.expect("client close");
+    });
+
+    let received = tokio::time::timeout(DEADLINE, async {
+        let (s, c) = tokio::join!(server, client);
+        c.unwrap();
+        s.unwrap()
+    })
+    .await
+    .expect("test_nagle_disabled_sends_each_write_immediately timed out");
+
+    assert_eq!(received, b"abbcccdddd");
+}
