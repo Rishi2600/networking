@@ -43,7 +43,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::congestion_control::{CongestionControl, LossKind, RenoCC};
-use crate::packet::{flags, Header, Packet};
+use crate::packet::{flags, Header, Packet, SackBlock};
 use crate::persist_timer::{PersistTimer, PersistTransition};
 
 // Re-export so existing code that imports from gbn_sender continues to compile.
@@ -102,6 +102,10 @@ pub struct GbnEntry {
     pub tx_count: u32,
     /// Wall-clock time of the most recent transmission.
     pub sent_at: Instant,
+    /// `true` when a SACK block from the receiver covers this segment's entire
+    /// byte range.  [`GbnSender::retransmit_oldest`] skips sacked entries so
+    /// that only genuinely missing segments are retransmitted.
+    pub sacked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +341,7 @@ impl<CC: CongestionControl> GbnSender<CC> {
             packet,
             tx_count: 1,
             sent_at: Instant::now(),
+            sacked: false,
         });
         self.next_seq = self.next_seq.wrapping_add(payload_len);
     }
@@ -482,7 +487,9 @@ impl<CC: CongestionControl> GbnSender<CC> {
     ///
     /// [`on_timeout_cc`]: Self::on_timeout_cc
     pub fn retransmit_oldest(&mut self) -> Option<Packet> {
-        if let Some(entry) = self.window.front_mut() {
+        // Skip SACK-covered entries: only retransmit the first segment the
+        // receiver has NOT yet acknowledged (either cumulatively or via SACK).
+        if let Some(entry) = self.window.iter_mut().find(|e| !e.sacked) {
             entry.tx_count += 1;
             entry.sent_at = Instant::now();
             self.sr_retransmit_count += 1;
@@ -559,6 +566,41 @@ impl<CC: CongestionControl> GbnSender<CC> {
     /// Number of consecutive duplicate ACKs seen since the last new ACK.
     pub fn dup_ack_count(&self) -> u32 {
         self.dup_ack_count
+    }
+
+    // -----------------------------------------------------------------------
+    // SACK processing
+    // -----------------------------------------------------------------------
+
+    /// Mark window entries covered by the receiver's SACK blocks.
+    ///
+    /// A segment is considered SACKed when its entire byte range
+    /// `[seq, seq+len)` is contained within one of the supplied blocks.
+    /// Already-marked entries are skipped (idempotent).
+    ///
+    /// Sacked entries are skipped by [`retransmit_oldest`] so that only
+    /// genuinely missing segments are retransmitted on timeout or fast
+    /// retransmit.  The `sacked` flag is cleared automatically when the
+    /// entry is popped from the window by a cumulative ACK.
+    ///
+    /// [`retransmit_oldest`]: Self::retransmit_oldest
+    pub fn process_sack(&mut self, blocks: &[SackBlock]) {
+        if blocks.is_empty() {
+            return;
+        }
+        for entry in self.window.iter_mut() {
+            if entry.sacked {
+                continue;
+            }
+            let seq = entry.packet.header.seq;
+            let end = seq.wrapping_add(entry.packet.payload.len() as u32);
+            for block in blocks {
+                if seq_le(block.left, seq) && seq_le(end, block.right) {
+                    entry.sacked = true;
+                    break;
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -985,6 +1027,7 @@ mod tests {
                 packet: make_pkt(i * 4, 4),
                 tx_count: 1,
                 sent_at: Instant::now(),
+                sacked: false,
             });
         }
         assert_eq!(s.in_flight(), 6);
@@ -1004,6 +1047,7 @@ mod tests {
             packet: make_pkt(0, 4),
             tx_count: 1,
             sent_at: Instant::now(),
+            sacked: false,
         });
 
         s.on_timeout_cc();
@@ -1020,6 +1064,7 @@ mod tests {
                 packet: make_pkt(i * 4, 4),
                 tx_count: 1,
                 sent_at: Instant::now(),
+                sacked: false,
             });
         }
         s.next_seq = 16;
@@ -1233,5 +1278,85 @@ mod tests {
         // Now window is empty; a re-ACK of send_base is NOT treated as a dup.
         let r2 = s.on_ack(8);
         assert!(!r2.dup_ack, "dup-ACK only counted when there are unacked segments");
+    }
+
+    // ── SACK processing ──────────────────────────────────────────────────────
+
+    #[test]
+    fn process_sack_marks_covered_entry() {
+        let mut s = GbnSender::new(0, 4);
+        s.cc.cwnd = 4;
+        // Send two segments: seq=0 len=10, seq=10 len=10.
+        let p1 = s.build_data_packet(vec![0u8; 10], 0, 8192);
+        s.record_sent(p1);
+        let p2 = s.build_data_packet(vec![0u8; 10], 0, 8192);
+        s.record_sent(p2);
+        // seq=10..20 is SACKed.
+        s.process_sack(&[SackBlock { left: 10, right: 20 }]);
+        assert!(!s.window[0].sacked, "seq=0..10 not in SACK block");
+        assert!(s.window[1].sacked,  "seq=10..20 covered by SACK block");
+    }
+
+    #[test]
+    fn retransmit_oldest_skips_sacked_entry() {
+        let mut s = GbnSender::new(0, 4);
+        s.cc.cwnd = 4;
+        // Two segments in flight.
+        let p1 = s.build_data_packet(vec![0u8; 10], 0, 8192);
+        s.record_sent(p1);
+        let p2 = s.build_data_packet(vec![0u8; 10], 0, 8192);
+        s.record_sent(p2);
+        // SACK the oldest entry (seq=0..10).
+        s.window[0].sacked = true;
+        // retransmit_oldest must skip it and return the second segment (seq=10).
+        let pkt = s.retransmit_oldest().expect("should find unsacked segment");
+        assert_eq!(pkt.header.seq, 10, "should skip sacked seq=0 and retransmit seq=10");
+        assert_eq!(s.sr_retransmit_count, 1);
+    }
+
+    #[test]
+    fn retransmit_oldest_returns_none_when_all_sacked() {
+        let mut s = GbnSender::new(0, 4);
+        s.cc.cwnd = 4;
+        let p1 = s.build_data_packet(vec![0u8; 10], 0, 8192);
+        s.record_sent(p1);
+        s.window[0].sacked = true;
+        assert!(
+            s.retransmit_oldest().is_none(),
+            "no retransmit when all in-flight segments are sacked"
+        );
+    }
+
+    #[test]
+    fn process_sack_is_idempotent() {
+        let mut s = GbnSender::new(0, 4);
+        s.cc.cwnd = 4;
+        let p = s.build_data_packet(vec![0u8; 10], 0, 8192);
+        s.record_sent(p);
+        let block = SackBlock { left: 0, right: 10 };
+        s.process_sack(&[block.clone()]);
+        s.process_sack(&[block]);
+        assert!(s.window[0].sacked);
+        assert_eq!(s.window.len(), 1, "window unchanged after repeated SACK");
+    }
+
+    #[test]
+    fn sacked_flag_cleared_when_entry_cumulatively_acked() {
+        let mut s = GbnSender::new(0, 4);
+        s.cc.cwnd = 4;
+        // Three segments: sack the middle one, then cumulative ACK past it.
+        let p1 = s.build_data_packet(vec![0u8; 5], 0, 8192);
+        s.record_sent(p1);
+        let p2 = s.build_data_packet(vec![0u8; 5], 0, 8192);
+        s.record_sent(p2);
+        let p3 = s.build_data_packet(vec![0u8; 5], 0, 8192);
+        s.record_sent(p3);
+        // SACK p2 (seq=5..10).
+        s.process_sack(&[SackBlock { left: 5, right: 10 }]);
+        assert!(s.window[1].sacked);
+        // Cumulative ACK through seq=15 (covers all three).
+        let r = s.on_ack(15);
+        assert_eq!(r.acked_count, 3);
+        assert!(!s.has_unacked(), "all entries acked and removed from window");
     }
 }

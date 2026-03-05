@@ -61,7 +61,7 @@ use crate::congestion_control::{CongestionControl, RenoCC};
 use crate::connection::{ConnError, Connection};
 use crate::gbn_receiver::GbnReceiver;
 use crate::gbn_sender::{AckResult, GbnSender};
-use crate::packet::{flags, Header, Packet};
+use crate::packet::{flags, Header, Packet, SackBlock, TcpOption};
 use crate::persist_timer::PersistTransition;
 use crate::rtt::RttEstimator;
 use crate::socket::Socket;
@@ -448,7 +448,8 @@ impl<CC: CongestionControl> GbnConnection<CC> {
 
             // Piggybacked ACK: slide window, update RTT and congestion control.
             if h.flags & flags::ACK != 0 {
-                let n = self.on_ack_received(h.ack, h.window);
+                let sack_blocks = extract_sack_blocks(&pkt);
+                let n = self.on_ack_received(h.ack, h.window, &sack_blocks);
                 if n > 0 {
                     log::debug!(
                         "[gbn] ← ACK ack={} slid={} srtt={:?} rto={:?} peer_rwnd={}",
@@ -731,8 +732,11 @@ impl<CC: CongestionControl> GbnConnection<CC> {
     /// This centralises all ACK handling so that every code path — `send`,
     /// `flush`, `recv`, and the event loop — updates the flow-control state,
     /// the RTT estimator, and the Reno congestion window.
-    fn on_ack_received(&mut self, ack_num: u32, peer_rwnd: u16) -> usize {
+    fn on_ack_received(&mut self, ack_num: u32, peer_rwnd: u16, sack_blocks: &[SackBlock]) -> usize {
         let AckResult { acked_count, rtt_sample, dup_ack: _ } = self.sender.on_ack(ack_num);
+        // Apply SACK information so the sender knows which segments are already
+        // held by the receiver and can skip them on retransmission.
+        self.sender.process_sack(sack_blocks);
         // Always update the peer's advertised receive window, even for dup-ACKs,
         // because the window field in the ACK reflects the peer's current buffer.
         // PersistTransition is managed by callers that own the timer futures.
@@ -780,19 +784,16 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         Ok(())
     }
 
-    /// Retransmit only the oldest unacked segment (Reno fast retransmit).
+    /// Retransmit the oldest unsacked segment (Reno fast retransmit).
     ///
     /// Called after 3 consecutive duplicate ACKs have been detected.
+    /// Delegates to [`GbnSender::retransmit_oldest`] which skips any entries
+    /// already covered by a SACK block and increments `tx_count` to suppress
+    /// the RTT sample on the next ACK (Karn's algorithm).
     async fn fast_retransmit(&mut self) -> Result<(), ConnError> {
-        if let Some(entry) = self.sender.window_entries().next() {
-            let pkt = entry.packet.clone();
+        if let Some(pkt) = self.sender.retransmit_oldest() {
             log::debug!("[gbn] fast-retransmit seq={}", pkt.header.seq);
             self.socket.send_to(&pkt, self.peer).await?;
-        }
-        // Mark the retransmitted segment so Karn's algorithm suppresses its
-        // RTT sample on the next ACK.
-        if let Some(e) = self.sender.window.front_mut() {
-            e.tx_count += 1;
         }
         Ok(())
     }
@@ -827,7 +828,8 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         }
 
         if h.flags & flags::ACK != 0 {
-            let newly_acked = self.on_ack_received(h.ack, h.window);
+            let sack_blocks = extract_sack_blocks(&pkt);
+            let newly_acked = self.on_ack_received(h.ack, h.window, &sack_blocks);
             window_advanced = newly_acked > 0;
 
             // Reno fast retransmit: 3 consecutive duplicate ACKs signal loss.
@@ -854,15 +856,21 @@ impl<CC: CongestionControl> GbnConnection<CC> {
     }
 
     fn make_ack_pkt(&self) -> Packet {
+        let sack_blocks = self.receiver.sack_blocks();
+        let options = if sack_blocks.is_empty() {
+            vec![]
+        } else {
+            vec![TcpOption::Sack(sack_blocks)]
+        };
         Packet {
             header: Header {
                 seq: self.sender.next_seq,
                 ack: self.receiver.ack_number(),
-                flags: flags::ACK,
+                flags: flags::ACK, // OPT is auto-set by encode() when options is non-empty
                 window: self.receiver.window_size(),
                 checksum: 0,
             },
-            options: vec![],
+            options,
             payload: vec![],
         }
     }
@@ -963,7 +971,8 @@ impl<CC: CongestionControl> GbnConnection<CC> {
 
             // Piggybacked ACK or stray cumulative ACK.
             if h.flags & flags::ACK != 0 {
-                self.on_ack_received(h.ack, h.window);
+                let sack_blocks = extract_sack_blocks(&pkt);
+                self.on_ack_received(h.ack, h.window, &sack_blocks);
             }
 
             // Data segment: the peer might still be sending before it closes.
@@ -1539,4 +1548,23 @@ fn build_fin<CC: CongestionControl>(sender: &GbnSender<CC>, receiver: &GbnReceiv
 #[inline]
 fn tok_now() -> tokio::time::Instant {
     tokio::time::Instant::now()
+}
+
+/// Extract SACK blocks from an incoming packet's options list.
+///
+/// Returns a flat `Vec<SackBlock>` combining all `TcpOption::Sack` entries.
+/// In practice a packet carries at most one SACK option, but this handles
+/// the degenerate case of multiple entries gracefully.
+fn extract_sack_blocks(pkt: &Packet) -> Vec<SackBlock> {
+    pkt.options
+        .iter()
+        .filter_map(|o| {
+            if let TcpOption::Sack(b) = o {
+                Some(b.as_slice())
+            } else {
+                None
+            }
+        })
+        .flat_map(|b| b.iter().cloned())
+        .collect()
 }

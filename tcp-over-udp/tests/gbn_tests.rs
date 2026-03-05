@@ -1832,3 +1832,233 @@ async fn test_nagle_disabled_sends_each_write_immediately() {
 
     assert_eq!(received, b"abbcccdddd");
 }
+
+// ---------------------------------------------------------------------------
+// Test 36: SACK — reordering does not cause spurious retransmit
+// ---------------------------------------------------------------------------
+//
+// Four segments are sent.  Segments 1–3 (seq 8, 16, 24) arrive at the
+// receiver before segment 0 (seq 0).  The receiver builds a SACK block
+// [{8, 32}] covering all three buffered segments.  When the sender processes
+// that SACK, entries for seq 8, 16, and 24 become sacked.
+//
+// Consequence: `retransmit_oldest()` skips the sacked entries and returns
+// seq=0 — the truly missing segment — as the only retransmit candidate.
+// `sr_retransmit_count` rises to exactly 1 when we call `retransmit_oldest()`
+// once, which is correct.  No additional retransmit occurs for the already-
+// received segments.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sack_reorder_no_spurious_retransmit() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+    use tcp_over_udp::gbn_sender::GbnSender;
+    use tcp_over_udp::packet::SackBlock;
+
+    // Sender: window=4, cwnd=4, 4 segments of 8 bytes each.
+    let mut sender = GbnSender::new(0, 4);
+    sender.cc.cwnd = 4;
+    for _ in 0..4 {
+        let pkt = sender.build_data_packet(vec![0u8; 8], 0, 8192);
+        sender.record_sent(pkt);
+    }
+    assert_eq!(sender.in_flight(), 4);
+
+    // Receiver expects seq=0.
+    let mut receiver = GbnReceiver::new(0);
+
+    // Network reordering: segments 1–3 arrive first (seq 8, 16, 24), all OOO.
+    assert!(!receiver.on_segment(8,  &[1u8; 8]));
+    assert!(!receiver.on_segment(16, &[2u8; 8]));
+    assert!(!receiver.on_segment(24, &[3u8; 8]));
+    assert_eq!(receiver.ack_number(), 0, "rcv_nxt must not advance while seq=0 is missing");
+
+    // Receiver advertises one merged SACK block covering [8, 32).
+    let sack = receiver.sack_blocks();
+    assert_eq!(sack.len(), 1, "three contiguous OOO segments must merge into one block");
+    assert_eq!(sack[0], SackBlock { left: 8, right: 32 });
+
+    // Sender marks entries covered by the SACK block as sacked.
+    sender.process_sack(&sack);
+
+    // Only `retransmit_oldest` for the truly missing segment (seq=0) should fire.
+    let pkt = sender
+        .retransmit_oldest()
+        .expect("seq=0 must be the retransmit candidate");
+    assert_eq!(pkt.header.seq, 0, "only the non-sacked segment must be retransmitted");
+    assert_eq!(
+        sender.sr_retransmit_count(),
+        1,
+        "exactly one retransmit for the missing segment; none for sacked ones"
+    );
+
+    // Deliver the retransmitted seq=0 — triggers OOO chain delivery.
+    assert!(receiver.on_segment(0, &[0u8; 8]));
+    assert_eq!(receiver.ack_number(), 32, "all four segments delivered after gap fill");
+
+    // Cumulative ACK=32 clears the sender window.
+    let r = sender.on_ack(32);
+    assert_eq!(r.acked_count, 4, "all four segments must be cumulatively acked");
+    assert!(!sender.has_unacked());
+}
+
+// ---------------------------------------------------------------------------
+// Test 37: SACK — only the lost middle segment is retransmitted
+// ---------------------------------------------------------------------------
+//
+// Three segments are sent.  The first (seq 0) and third (seq 16) arrive at
+// the receiver; the middle one (seq 8) is lost.  The receiver ACKs seq=8
+// cumulatively (the first segment) and includes a SACK block [{16, 24}] for
+// the buffered third segment.  After the cumulative ACK advances the sender
+// window past seq=0, `retransmit_oldest()` must return seq=8 — not seq=16
+// (which is already sacked).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sack_middle_segment_loss() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+    use tcp_over_udp::gbn_sender::GbnSender;
+    use tcp_over_udp::packet::SackBlock;
+
+    // Sender: window=3, cwnd=3, three segments of 8 bytes each.
+    let mut sender = GbnSender::new(0, 3);
+    sender.cc.cwnd = 3;
+    for _ in 0..3 {
+        let pkt = sender.build_data_packet(vec![0u8; 8], 0, 8192);
+        sender.record_sent(pkt);
+    }
+    assert_eq!(sender.in_flight(), 3);
+
+    // Receiver expects seq=0.
+    let mut receiver = GbnReceiver::new(0);
+
+    // seg 0 (seq=0) arrives in-order → accepted.
+    assert!(receiver.on_segment(0, &[0u8; 8]));
+    assert_eq!(receiver.ack_number(), 8);
+
+    // seg 1 (seq=8) is LOST — never delivered.
+
+    // seg 2 (seq=16) arrives OOO → buffered.
+    assert!(!receiver.on_segment(16, &[2u8; 8]));
+    assert_eq!(receiver.ack_number(), 8, "rcv_nxt stays at 8 while seq=8 is missing");
+
+    // Receiver reports one SACK block for the buffered segment.
+    let sack = receiver.sack_blocks();
+    assert_eq!(sack.len(), 1);
+    assert_eq!(sack[0], SackBlock { left: 16, right: 24 });
+
+    // Cumulative ACK=8 pops seq=0 from the sender window.
+    let r = sender.on_ack(8);
+    assert_eq!(r.acked_count, 1);
+
+    // Sender marks the remaining window entries using SACK.
+    sender.process_sack(&sack);
+
+    // Window now holds seq=8 (not sacked) and seq=16 (sacked).
+    // retransmit_oldest must return seq=8 — skipping seq=16.
+    let pkt = sender
+        .retransmit_oldest()
+        .expect("seq=8 must be the retransmit candidate");
+    assert_eq!(pkt.header.seq, 8, "middle segment must be the sole retransmit target");
+    assert_eq!(sender.sr_retransmit_count(), 1);
+
+    // Deliver the retransmitted seq=8 → OOO chain delivers seq=8 then seq=16.
+    assert!(receiver.on_segment(8, &[1u8; 8]));
+    assert_eq!(receiver.ack_number(), 24, "all three segments delivered");
+
+    // Cumulative ACK=24 clears the window.
+    let r2 = sender.on_ack(24);
+    assert_eq!(r2.acked_count, 2, "seq=8 and seq=16 cleared by ACK=24");
+    assert!(!sender.has_unacked());
+}
+
+// ---------------------------------------------------------------------------
+// Test 38: SACK — two disjoint gaps are each retransmitted exactly once
+// ---------------------------------------------------------------------------
+//
+// Six segments are sent.  Segments at seq 8 and seq 32 are lost; the other
+// four arrive.  The receiver builds two disjoint SACK blocks: [{16,32}] and
+// [{40,48}].  The sender uses those blocks to skip sacked entries and
+// retransmits only seq=8 and seq=32 — total `sr_retransmit_count` == 2.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sack_two_disjoint_gaps() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+    use tcp_over_udp::gbn_sender::GbnSender;
+    use tcp_over_udp::packet::SackBlock;
+
+    // Sender: window=6, cwnd=6, six segments of 8 bytes each (seq 0…40).
+    let mut sender = GbnSender::new(0, 6);
+    sender.cc.cwnd = 6;
+    for _ in 0..6 {
+        let pkt = sender.build_data_packet(vec![0u8; 8], 0, 8192);
+        sender.record_sent(pkt);
+    }
+    // Segments: seq=0, 8, 16, 24, 32, 40.
+    assert_eq!(sender.in_flight(), 6);
+
+    // Receiver expects seq=0.
+    let mut receiver = GbnReceiver::new(0);
+
+    // seq=0 arrives in-order → delivered.
+    assert!(receiver.on_segment(0, &[0u8; 8]));
+    assert_eq!(receiver.ack_number(), 8);
+
+    // seq=8  LOST (never arrives).
+
+    // seq=16, seq=24 arrive OOO → buffered (gap at 8).
+    assert!(!receiver.on_segment(16, &[2u8; 8]));
+    assert!(!receiver.on_segment(24, &[3u8; 8]));
+
+    // seq=32 LOST (never arrives).
+
+    // seq=40 arrives OOO → buffered (gap at 32).
+    assert!(!receiver.on_segment(40, &[5u8; 8]));
+    assert_eq!(receiver.ack_number(), 8, "rcv_nxt stays at 8 — gap at seq=8");
+
+    // Receiver has two disjoint SACK blocks.
+    let sack = receiver.sack_blocks();
+    assert_eq!(sack.len(), 2, "two disjoint OOO regions must produce two blocks");
+    assert_eq!(sack[0], SackBlock { left: 16, right: 32 });
+    assert_eq!(sack[1], SackBlock { left: 40, right: 48 });
+
+    // Cumulative ACK=8 pops seq=0.
+    let r = sender.on_ack(8);
+    assert_eq!(r.acked_count, 1);
+
+    // Apply SACK — window now: seq=8(!), seq=16(✓), seq=24(✓), seq=32(!), seq=40(✓).
+    sender.process_sack(&sack);
+
+    // First retransmit: seq=8 (oldest non-sacked).
+    let pkt1 = sender.retransmit_oldest().expect("seq=8 must be retransmit candidate");
+    assert_eq!(pkt1.header.seq, 8);
+
+    // Deliver seq=8 to receiver → chain delivers seq=8, 16, 24 → ack=32.
+    assert!(receiver.on_segment(8, &[1u8; 8]));
+    assert_eq!(receiver.ack_number(), 32, "gap at 8 filled; delivers up to 32");
+
+    // Cumulative ACK=32 pops seq=8, 16, 24 from sender.
+    let r2 = sender.on_ack(32);
+    assert_eq!(r2.acked_count, 3);
+    // Remaining window: seq=32(!), seq=40(✓).
+
+    // Re-apply the second SACK block (sender still knows about seq=40).
+    sender.process_sack(&[SackBlock { left: 40, right: 48 }]);
+
+    // Second retransmit: seq=32 (oldest remaining non-sacked).
+    let pkt2 = sender.retransmit_oldest().expect("seq=32 must be retransmit candidate");
+    assert_eq!(pkt2.header.seq, 32);
+
+    // Deliver seq=32 → chain delivers seq=32, 40 → ack=48.
+    assert!(receiver.on_segment(32, &[4u8; 8]));
+    assert_eq!(receiver.ack_number(), 48, "all six segments delivered");
+
+    // Final cumulative ACK=48 clears the window.
+    let r3 = sender.on_ack(48);
+    assert_eq!(r3.acked_count, 2, "seq=32 and seq=40 cleared by ACK=48");
+    assert!(!sender.has_unacked());
+
+    // Exactly two retransmits occurred — one per gap.
+    assert_eq!(sender.sr_retransmit_count(), 2, "exactly two retransmits for two gaps");
+}

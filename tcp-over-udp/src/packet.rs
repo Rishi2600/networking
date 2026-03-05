@@ -32,11 +32,14 @@
 //! Total fixed header size: [`HEADER_LEN`] = 15 bytes.
 //! seq(4) + ack(4) + flags(1) + window(2) + payload_len(2) + checksum(2)
 //!
-//! ## TCP-style options (variable length, only in SYN / SYN-ACK)
+//! ## TCP-style options (variable length)
 //!
 //! Options are TLV-encoded and placed **immediately after the fixed header**
-//! (i.e. they contribute to `payload_len`).  They are only present when the
-//! SYN flag is set; data segments never carry options.
+//! (i.e. they contribute to `payload_len`).  The [`flags::OPT`] bit in the
+//! header signals that options are present; [`Packet::encode`] sets it
+//! automatically when the options list is non-empty.  Data segments always
+//! have an empty options list so the OPT bit is never set on them, preventing
+//! the decoder from mis-parsing user payload bytes as options.
 //!
 //! ```text
 //!  +--------+--------+--------...+
@@ -49,15 +52,12 @@
 //! | 0x00 | —      | End-of-options-list (EOL) — stops parsing |
 //! | 0x01 | —      | No-operation (NOP) — 1 byte |
 //! | 0x02 | 4      | Maximum Segment Size (`u16` big-endian) |
-//!
-//! The kind-0x05 slot is reserved for future SACK blocks (not yet decoded).
+//! | 0x05 | 2+8n   | Selective ACK — n×(left:u32, right:u32) half-open ranges |
 //!
 //! ## Backward compatibility
 //!
-//! Peers that predate this options extension ignore the payload of SYN /
-//! SYN-ACK packets — they only inspect the fixed header fields.  So placing
-//! options in that area is transparently backward-compatible.  When talking to
-//! an old peer (whose SYN carries no options), the new peer falls back to the
+//! Peers that do not set OPT see no options in incoming packets.  When talking
+//! to a peer whose SYN carries no options, the new peer falls back to the
 //! configured [`DEFAULT_MSS`].
 
 /// Bit-flag constants for the `flags` header field.
@@ -70,8 +70,12 @@ pub mod flags {
     pub const FIN: u8 = 0b0000_0100;
     /// Reset the connection.
     pub const RST: u8 = 0b0000_1000;
+    /// Options-present marker — automatically set by [`Packet::encode`] when
+    /// the options list is non-empty.  [`Packet::decode`] uses this to decide
+    /// whether to invoke the option parser on the payload area.
+    pub const OPT: u8 = 0b0001_0000;
     /// Mask of all defined flag bits; any bit outside this mask is invalid.
-    pub const VALID_FLAGS: u8 = SYN | ACK | FIN | RST;
+    pub const VALID_FLAGS: u8 = SYN | ACK | FIN | RST | OPT;
 }
 
 /// Well-known option kind bytes (TCP-compatible numbering).
@@ -82,7 +86,8 @@ pub mod option_kind {
     pub const NOP: u8 = 1;
     /// Maximum Segment Size — Kind=2, Length=4, Data=u16 big-endian.
     pub const MSS: u8 = 2;
-    // Kind 5 is reserved for SACK (future extension).
+    /// Selective Acknowledgement blocks — Kind=5, Length=2+8n, Data=n×(left:u32,right:u32).
+    pub const SACK: u8 = 5;
 }
 
 /// Default MSS when the peer does not advertise one.
@@ -103,20 +108,34 @@ const OFF_PAYLOAD_LEN: usize = 11;
 const OFF_CHECKSUM: usize = 13;
 
 // ---------------------------------------------------------------------------
+// SackBlock
+// ---------------------------------------------------------------------------
+
+/// A single SACK block: the half-open byte range `[left, right)` that the
+/// receiver has already buffered out-of-order.
+///
+/// `left` is the first sequence number in the block; `right` is the first
+/// sequence number **not** in the block (exclusive upper bound).  This
+/// matches the TCP SACK convention from RFC 2018.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SackBlock {
+    /// First sequence number covered by this block (inclusive).
+    pub left: u32,
+    /// First sequence number **not** covered (exclusive).
+    pub right: u32,
+}
+
+// ---------------------------------------------------------------------------
 // TcpOption
 // ---------------------------------------------------------------------------
 
-/// A single TCP-style option that may appear in a SYN or SYN-ACK packet.
+/// A single TCP-style option that may appear in any packet.
 ///
 /// Options are serialised in TLV format immediately after the fixed 15-byte
-/// header and terminated with an [`option_kind::EOL`] byte.  They are only
-/// meaningful — and only decoded — when the SYN flag is set.
-///
-/// # Future extensibility
-///
-/// The kind namespace follows TCP's numbering, so SACK (kind 5) can be added
-/// by inserting a `Sack(Vec<SackBlock>)` variant here and implementing the
-/// corresponding encode/decode arms.
+/// header and terminated with an [`option_kind::EOL`] byte.  The
+/// [`flags::OPT`] bit in the header signals that the options area is present;
+/// [`Packet::encode`] sets it automatically when the options list is
+/// non-empty, and [`Packet::decode`] uses it to decide whether to parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TcpOption {
     /// Maximum Segment Size — the largest payload this sender can accept.
@@ -127,6 +146,14 @@ pub enum TcpOption {
 
     /// No-operation padding byte (kind = 1, no length/data field).
     Nop,
+
+    /// Selective Acknowledgement blocks (kind = 5).
+    ///
+    /// Each block describes a half-open range `[left, right)` of bytes the
+    /// receiver has already buffered out-of-order.  Carried on pure ACK
+    /// packets to inform the sender which segments can be skipped on
+    /// retransmission.
+    Sack(Vec<SackBlock>),
 }
 
 impl TcpOption {
@@ -135,7 +162,8 @@ impl TcpOption {
     pub fn wire_len(&self) -> usize {
         match self {
             TcpOption::Nop => 1,
-            TcpOption::Mss(_) => 4, // kind(1) + length(1) + value(2)
+            TcpOption::Mss(_) => 4,                  // kind(1) + length(1) + value(2)
+            TcpOption::Sack(b) => 2 + 8 * b.len(),  // kind(1) + length(1) + n×8
         }
     }
 }
@@ -171,16 +199,17 @@ pub struct Header {
 
 /// A complete protocol datagram: fixed header + options + payload bytes.
 ///
-/// `options` is non-empty only for SYN and SYN-ACK packets; it is empty for
-/// all data segments and pure ACKs.  During [`encode`] the options are
-/// serialised before `payload`; during [`decode`] they are parsed back out
-/// when the SYN flag is set.
+/// `options` is non-empty for SYN/SYN-ACK (MSS negotiation) and for pure
+/// ACKs that carry SACK blocks.  Data segments always have `options: vec![]`.
+/// During [`encode`] the options are serialised before `payload` and the
+/// [`flags::OPT`] bit is set automatically; during [`decode`] options are
+/// parsed when the OPT flag is set.
 ///
 /// [`encode`]: Packet::encode
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
     pub header: Header,
-    /// TCP-style options (SYN / SYN-ACK only).  Empty for data segments.
+    /// TCP-style options.  Non-empty for SYN/SYN-ACK and for ACKs with SACK.
     pub options: Vec<TcpOption>,
     pub payload: Vec<u8>,
 }
@@ -197,9 +226,8 @@ impl Packet {
     ///
     /// Returns [`Err`] if the combined options + payload exceeds 65 535 bytes.
     pub fn encode(&self) -> Result<Vec<u8>, PacketError> {
-        let is_syn = self.header.flags & flags::SYN != 0;
-
-        let opts_bytes: Vec<u8> = if is_syn && !self.options.is_empty() {
+        // Emit options whenever the list is non-empty (not just for SYN).
+        let opts_bytes: Vec<u8> = if !self.options.is_empty() {
             encode_options(&self.options)
         } else {
             Vec::new()
@@ -214,14 +242,18 @@ impl Packet {
 
         buf[OFF_SEQ..OFF_SEQ + 4].copy_from_slice(&self.header.seq.to_be_bytes());
         buf[OFF_ACK..OFF_ACK + 4].copy_from_slice(&self.header.ack.to_be_bytes());
-        buf[OFF_FLAGS] = self.header.flags;
+        // Auto-set the OPT flag when options are present so the decoder knows
+        // to invoke the option parser, without relying on the SYN flag.
+        let flags_wire = self.header.flags
+            | if !self.options.is_empty() { flags::OPT } else { 0 };
+        buf[OFF_FLAGS] = flags_wire;
         buf[OFF_WINDOW..OFF_WINDOW + 2].copy_from_slice(&self.header.window.to_be_bytes());
         buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 2]
             .copy_from_slice(&(total_payload_len as u16).to_be_bytes());
         // Checksum field is zero while computing.
         buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].copy_from_slice(&0u16.to_be_bytes());
 
-        // Options area (only for SYN packets).
+        // Options area (present whenever options list is non-empty).
         let opts_end = HEADER_LEN + opts_bytes.len();
         buf[HEADER_LEN..opts_end].copy_from_slice(&opts_bytes);
         // Data payload.
@@ -291,9 +323,11 @@ impl Packet {
             return Err(PacketError::ChecksumFailed);
         }
 
-        // Split options from payload when SYN is set.
+        // Parse options when the OPT flag is set.  This prevents treating the
+        // start of a data payload as option bytes (OPT is only set when the
+        // sender explicitly included options).
         let raw_after_header = &buf[HEADER_LEN..];
-        let (options, payload_bytes) = if raw_flags & flags::SYN != 0 {
+        let (options, payload_bytes) = if raw_flags & flags::OPT != 0 {
             decode_options_from(raw_after_header)
         } else {
             (Vec::new(), raw_after_header)
@@ -330,6 +364,14 @@ fn encode_options(options: &[TcpOption]) -> Vec<u8> {
                 buf.push(option_kind::MSS);
                 buf.push(4); // total option length (kind + length + 2-byte value)
                 buf.extend_from_slice(&mss.to_be_bytes());
+            }
+            TcpOption::Sack(blocks) => {
+                buf.push(option_kind::SACK);
+                buf.push((2 + 8 * blocks.len()) as u8); // kind(1)+len(1)+n*8
+                for block in blocks {
+                    buf.extend_from_slice(&block.left.to_be_bytes());
+                    buf.extend_from_slice(&block.right.to_be_bytes());
+                }
             }
         }
     }
@@ -372,6 +414,31 @@ fn decode_options_from(data: &[u8]) -> (Vec<TcpOption>, &[u8]) {
                 let mss = u16::from_be_bytes([data[i + 2], data[i + 3]]);
                 options.push(TcpOption::Mss(mss));
                 i += 4;
+            }
+            option_kind::SACK => {
+                // Need at least kind(1) + length(1).
+                if i + 2 > data.len() {
+                    break;
+                }
+                let len = data[i + 1] as usize;
+                // Length must be >= 2 (kind+len) and data portion divisible by 8.
+                if len < 2 || !(len - 2).is_multiple_of(8) || i + len > data.len() {
+                    break;
+                }
+                let n = (len - 2) / 8;
+                let mut blocks = Vec::with_capacity(n);
+                for j in 0..n {
+                    let off = i + 2 + j * 8;
+                    let left = u32::from_be_bytes(
+                        data[off..off + 4].try_into().unwrap(),
+                    );
+                    let right = u32::from_be_bytes(
+                        data[off + 4..off + 8].try_into().unwrap(),
+                    );
+                    blocks.push(SackBlock { left, right });
+                }
+                options.push(TcpOption::Sack(blocks));
+                i += len;
             }
             _ => break, // unknown kind — stop and leave byte in payload
         }
@@ -571,9 +638,10 @@ mod tests {
 
     #[test]
     fn decode_invalid_flags_returns_error() {
-        // Build a valid packet, then flip an undefined flag bit.
+        // Build a valid packet, then flip bits that are still undefined (5-7).
+        // Bit 4 (OPT) is now a valid flag.
         let mut bytes = make_packet(0, 0, flags::SYN, 0, b"").encode().unwrap();
-        bytes[OFF_FLAGS] |= 0b1111_0000; // bits 4–7 are undefined
+        bytes[OFF_FLAGS] |= 0b1110_0000; // bits 5–7 are undefined
         assert_eq!(Packet::decode(&bytes), Err(PacketError::InvalidFlags));
     }
 
@@ -596,7 +664,8 @@ mod tests {
         let bytes = syn.encode().unwrap();
         let decoded = Packet::decode(&bytes).unwrap();
 
-        assert_eq!(decoded.header.flags, flags::SYN);
+        // OPT is auto-set by encode() because options are non-empty.
+        assert_eq!(decoded.header.flags, flags::SYN | flags::OPT);
         assert_eq!(decoded.options, vec![TcpOption::Mss(1460)]);
         assert!(decoded.payload.is_empty());
     }
@@ -620,21 +689,24 @@ mod tests {
     }
 
     #[test]
-    fn non_syn_options_not_encoded() {
-        // Options on a non-SYN packet are silently dropped on encode.
+    fn non_syn_options_are_encoded() {
+        // Options on any packet (including non-SYN) are now encoded when non-empty.
+        // The OPT flag is auto-set by encode() so the decoder knows to parse.
         let pkt = Packet {
             header: Header { seq: 0, ack: 0, flags: flags::ACK, window: 0, checksum: 0 },
             options: vec![TcpOption::Mss(1460)],
             payload: b"data".to_vec(),
         };
         let bytes = pkt.encode().unwrap();
-        // Should be exactly HEADER_LEN + 4 bytes (no options in wire form).
-        assert_eq!(bytes.len(), HEADER_LEN + 4);
+        // options: MSS(4) + EOL(1) = 5 bytes; payload: "data" = 4 bytes.
+        assert_eq!(bytes.len(), HEADER_LEN + 5 + 4);
 
         let decoded = Packet::decode(&bytes).unwrap();
-        // Options are not parsed for non-SYN; payload is "data".
-        assert!(decoded.options.is_empty());
+        // OPT flag triggers option parsing; MSS and payload both survive.
+        assert_eq!(decoded.options, vec![TcpOption::Mss(1460)]);
         assert_eq!(decoded.payload, b"data");
+        // OPT flag is set in the decoded header.
+        assert_ne!(decoded.header.flags & flags::OPT, 0);
     }
 
     #[test]
@@ -702,5 +774,88 @@ mod tests {
         let decoded = Packet::decode(&syn_ack.encode().unwrap()).unwrap();
         assert_eq!(decoded.options, vec![TcpOption::Mss(536)]);
         assert!(decoded.payload.is_empty());
+    }
+
+    // ── SACK option ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn sack_option_single_block_roundtrip() {
+        let pkt = Packet {
+            header: Header {
+                seq: 100,
+                ack: 50,
+                flags: flags::ACK,
+                window: 8192,
+                checksum: 0,
+            },
+            options: vec![TcpOption::Sack(vec![SackBlock { left: 110, right: 120 }])],
+            payload: vec![],
+        };
+        let bytes = pkt.encode().unwrap();
+        // OPT flag must be set on the wire.
+        assert_ne!(bytes[OFF_FLAGS] & flags::OPT, 0);
+        let decoded = Packet::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.options,
+            vec![TcpOption::Sack(vec![SackBlock { left: 110, right: 120 }])]
+        );
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn sack_option_multiple_blocks_roundtrip() {
+        let blocks = vec![
+            SackBlock { left: 10, right: 20 },
+            SackBlock { left: 30, right: 40 },
+            SackBlock { left: 50, right: 60 },
+        ];
+        let pkt = Packet {
+            header: Header {
+                seq: 0,
+                ack: 5,
+                flags: flags::ACK,
+                window: 4096,
+                checksum: 0,
+            },
+            options: vec![TcpOption::Sack(blocks.clone())],
+            payload: vec![],
+        };
+        let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
+        assert_eq!(decoded.options, vec![TcpOption::Sack(blocks)]);
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn sack_wire_length_correct() {
+        // 1 block: kind(1) + len(1) + 8 bytes + EOL(1) = 11 bytes of options.
+        let opt = TcpOption::Sack(vec![SackBlock { left: 0, right: 8 }]);
+        assert_eq!(opt.wire_len(), 10); // kind(1)+len(1)+1*8
+        let pkt = Packet {
+            header: Header { seq: 0, ack: 0, flags: flags::ACK, window: 0, checksum: 0 },
+            options: vec![opt],
+            payload: vec![],
+        };
+        // Wire: HEADER_LEN + options(10) + EOL(1) = HEADER_LEN + 11.
+        assert_eq!(pkt.encode().unwrap().len(), HEADER_LEN + 11);
+    }
+
+    #[test]
+    fn no_options_means_no_opt_flag() {
+        // Packets without options must NOT have OPT set on the wire.
+        let pkt = make_packet(1, 2, flags::ACK, 512, b"hello");
+        let bytes = pkt.encode().unwrap();
+        assert_eq!(bytes[OFF_FLAGS] & flags::OPT, 0);
+    }
+
+    #[test]
+    fn sack_zero_blocks_roundtrip() {
+        // Sack(vec![]) is a degenerate option: kind(1)+len(1)+EOL(1) = 3 bytes.
+        let pkt = Packet {
+            header: Header { seq: 0, ack: 0, flags: flags::ACK, window: 0, checksum: 0 },
+            options: vec![TcpOption::Sack(vec![])],
+            payload: vec![],
+        };
+        let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
+        assert_eq!(decoded.options, vec![TcpOption::Sack(vec![])]);
     }
 }

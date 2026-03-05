@@ -20,6 +20,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::packet::SackBlock;
+
 // ---------------------------------------------------------------------------
 // GbnReceiver
 // ---------------------------------------------------------------------------
@@ -120,6 +122,33 @@ impl GbnReceiver {
             // Duplicate (seq < rcv_nxt) or no buffer space.
             false
         }
+    }
+
+    /// Compute SACK blocks from the current out-of-order buffer.
+    ///
+    /// Iterates `ooo_buffer` (which is already sorted by `BTreeMap`) and
+    /// merges contiguous entries into a single block.  Returns at most 4
+    /// blocks to keep ACK packets small.
+    ///
+    /// An empty return value means the receiver has no OOO data buffered —
+    /// the cumulative ACK alone is sufficient information for the sender.
+    pub fn sack_blocks(&self) -> Vec<SackBlock> {
+        let mut blocks: Vec<SackBlock> = Vec::new();
+        for (&seq, data) in &self.ooo_buffer {
+            let right = seq.wrapping_add(data.len() as u32);
+            if let Some(last) = blocks.last_mut() {
+                if last.right == seq {
+                    // Contiguous with the previous block — extend it.
+                    last.right = right;
+                    continue;
+                }
+            }
+            if blocks.len() == 4 {
+                break; // cap at 4 blocks to limit ACK size
+            }
+            blocks.push(SackBlock { left: seq, right });
+        }
+        blocks
     }
 
     /// Advance `RCV.NXT` past a received FIN (which consumes one sequence
@@ -383,5 +412,57 @@ mod tests {
         r.read(&mut drain);
         assert_eq!(r.window_size(), 20);
         assert!(r.on_segment(20, &[0u8; 1]), "segment accepted after drain");
+    }
+
+    // ── sack_blocks ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn sack_blocks_empty_when_no_ooo() {
+        let r = GbnReceiver::new(0);
+        assert!(r.sack_blocks().is_empty());
+    }
+
+    #[test]
+    fn sack_blocks_single_entry() {
+        let mut r = GbnReceiver::new(0);
+        r.on_segment(10, b"hello"); // OOO: gap [0, 10)
+        let blocks = r.sack_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].left, 10);
+        assert_eq!(blocks[0].right, 15);
+    }
+
+    #[test]
+    fn sack_blocks_contiguous_entries_merged() {
+        let mut r = GbnReceiver::new(0);
+        // Two contiguous OOO segments: [10,15) and [15,20).
+        r.on_segment(10, b"hello"); // seq=10, len=5 → right=15
+        r.on_segment(15, b"world"); // seq=15, len=5 → right=20 (contiguous)
+        let blocks = r.sack_blocks();
+        assert_eq!(blocks.len(), 1, "contiguous entries must be merged");
+        assert_eq!(blocks[0].left, 10);
+        assert_eq!(blocks[0].right, 20);
+    }
+
+    #[test]
+    fn sack_blocks_two_disjoint_gaps() {
+        let mut r = GbnReceiver::new(0);
+        r.on_segment(10, b"AAA"); // [10, 13)
+        r.on_segment(20, b"BBB"); // [20, 23)  — disjoint gap at [13,20)
+        let blocks = r.sack_blocks();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], crate::packet::SackBlock { left: 10, right: 13 });
+        assert_eq!(blocks[1], crate::packet::SackBlock { left: 20, right: 23 });
+    }
+
+    #[test]
+    fn sack_blocks_capped_at_four() {
+        let mut r = GbnReceiver::new(0);
+        // 5 disjoint OOO entries (gaps between each).
+        for i in 0u32..5 {
+            r.on_segment(100 + i * 10, b"XX"); // [100,102), [110,112), ...
+        }
+        let blocks = r.sack_blocks();
+        assert_eq!(blocks.len(), 4, "sack_blocks must return at most 4 blocks");
     }
 }
