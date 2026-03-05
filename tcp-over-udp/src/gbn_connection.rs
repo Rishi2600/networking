@@ -1197,21 +1197,58 @@ async fn event_loop(
             // The one-slot `staged` buffer prevents consuming items faster
             // than they can be dispatched while still allowing None to be
             // seen the moment the slot is free.
-            // Guard: accept from the channel when the staging queue is empty
-            // so that (a) Nagle can coalesce multiple app writes into the
-            // nagle_buf before the queue fills, and (b) None (send_tx dropped)
-            // is observable as soon as the slot is free.
+            // Guard: accept from the channel when the staging queue is empty.
+            //
+            // When staged is empty AND Nagle is enabled and holding data in
+            // nagle_buf, Branch 1 can still fire — each new write is pushed
+            // into nagle_buf for coalescing.  None (send_tx dropped) is
+            // observable as soon as staged is free.
             msg = app_rx.recv(), if staged.is_empty() && !fin_pending && !half_closed => {
                 match msg {
                     Some(payload) => {
                         // Push through the Nagle buffer.  When Nagle is disabled
-                        // (default), nagle_push returns MSS-sized chunks immediately.
-                        // When enabled, sub-MSS data may be held until conditions are met.
-                        let ready = sender.nagle_push(&payload, mss);
-                        staged.extend(ready);
-                        // The drain phase at the top of the next iteration sends
-                        // whatever is in `staged`.  We do NOT send inline here so
-                        // that the loop structure stays consistent.
+                        // (default), nagle_push returns MSS-sized chunks immediately;
+                        // when enabled, sub-MSS data may be held until the pipe
+                        // empties or the buffer reaches one MSS.
+                        let mut ready = sender.nagle_push(&payload, mss);
+
+                        if ready.is_empty() {
+                            // Nagle is coalescing: data sits in nagle_buf.
+                            // staged stays empty → Branch 1 can fire again on
+                            // the next select! to accumulate more writes.
+                        } else if sender.can_send() {
+                            // Fast path: window open — send the first segment
+                            // inline (mirrors the original behaviour; critical
+                            // for test correctness and liveness).
+                            let first = ready.remove(0);
+                            let pkt = sender.build_data_packet(
+                                first,
+                                receiver.ack_number(),
+                                receiver.window_size(),
+                            );
+                            if socket.send_to(&pkt, peer).await.is_err() {
+                                break;
+                            }
+                            sender.record_sent(pkt);
+                            retries = 0;
+                            if !retransmit_armed {
+                                retransmit_tmr.as_mut().reset(tok_now() + rto);
+                                retransmit_armed = true;
+                            }
+                            log::debug!("[gbn:loop] → DATA in_flight={}", sender.in_flight());
+                            // Overflow segments (data > MSS) go to staged and
+                            // are drained at the top of the next iteration.
+                            staged.extend(ready);
+                        } else {
+                            // Slow path: window shut — queue all ready segments.
+                            staged.extend(ready);
+                            if sender.persist.is_active() {
+                                persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
+                            } else if !retransmit_armed {
+                                retransmit_tmr.as_mut().reset(tok_now() + rto);
+                                retransmit_armed = true;
+                            }
+                        }
                     }
                     None => {
                         // send_tx dropped.  Queue the FIN; the drain phase at
