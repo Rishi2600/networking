@@ -242,23 +242,13 @@ impl Message {
             return Err(MessageError::LengthMismatch);
         }
 
-        // Checksum: verify with checksum field zeroed out.
-        let mut check_buf = buf.to_vec();
-        check_buf[OFF_CHECKSUM] = 0;
-        check_buf[OFF_CHECKSUM + 1] = 0;
-        if internet_checksum(&check_buf) != 0xFFFF
-            && internet_checksum(&check_buf) != 0x0000
-            && internet_checksum(buf) != 0xFFFF
-        {
-            // Proper RFC 1071 verification: checksum of full buffer (including stored checksum)
-            // should yield 0xFFFF (all-ones) when correct.
-            let stored = u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
-            if stored != 0 {
-                let recalc = internet_checksum(&check_buf);
-                if recalc != stored {
-                    return Err(MessageError::ChecksumFailed);
-                }
-            }
+        // RFC 1071 verification: the one's complement sum of all 16-bit words
+        // in a valid datagram — including the stored checksum field — must be
+        // all-ones (0xFFFF).  Because `internet_checksum` returns the one's
+        // complement of that sum, a valid buffer produces exactly 0x0000.
+        // No zeroing of the checksum field is required.
+        if internet_checksum(buf) != 0x0000 {
+            return Err(MessageError::ChecksumFailed);
         }
 
         let msg_kind = buf[OFF_KIND];
@@ -468,6 +458,80 @@ mod tests {
         buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].copy_from_slice(&cksum.to_be_bytes());
         let result = Message::decode(&buf);
         assert!(matches!(result, Err(MessageError::UnknownKind(0xFF))));
+    }
+
+    // ── Checksum-specific tests ───────────────────────────────────────────────
+
+    /// A correctly encoded packet must always be accepted.
+    #[test]
+    fn checksum_valid_packet_accepted() {
+        for msg in [
+            build_ping(1, 0),
+            build_ping(u64::MAX, u32::MAX),
+            build_ack(42, 100),
+            build_gossip(7, 3, vec![WireNodeEntry {
+                node_id: 1,
+                heartbeat: 0,
+                status: status::ALIVE,
+                ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
+                port: 9000,
+            }]),
+        ] {
+            let buf = msg.encode().unwrap();
+            assert!(
+                Message::decode(&buf).is_ok(),
+                "valid encoded packet must be accepted"
+            );
+        }
+    }
+
+    /// Every single-byte corruption must be detected.
+    #[test]
+    fn checksum_single_byte_corruption_rejected() {
+        let buf = build_ping(0xDEADBEEF_CAFEBABE, 42)
+            .encode()
+            .unwrap();
+        // Flip each byte individually; every flip must cause a decode failure.
+        for i in 0..buf.len() {
+            // Flipping the checksum field itself is a special case: the stored
+            // value is wrong, so the full-buffer sum will no longer be 0x0000.
+            let mut corrupted = buf.clone();
+            corrupted[i] ^= 0xFF;
+            assert!(
+                Message::decode(&corrupted).is_err(),
+                "corruption at byte {i} must be rejected"
+            );
+        }
+    }
+
+    /// A packet with a zero stored checksum is only valid if the data happens
+    /// to sum to 0xFFFF (i.e. the correct checksum really is 0x0000).
+    /// A zero checksum on arbitrary data must be rejected.
+    #[test]
+    fn checksum_zero_stored_value_rejected_when_data_nonzero() {
+        let msg = build_ping(1, 1);
+        let mut buf = msg.encode().unwrap();
+        // Overwrite the stored checksum with 0x0000.
+        buf[OFF_CHECKSUM] = 0x00;
+        buf[OFF_CHECKSUM + 1] = 0x00;
+        // The data is non-trivial, so the full-buffer sum won't be 0x0000.
+        assert!(
+            Message::decode(&buf).is_err(),
+            "zero checksum on non-zero data must be rejected"
+        );
+    }
+
+    /// Edge case: sender_id = 0, heartbeat = 0 (all-zero fields).
+    /// encode() must produce a non-trivial checksum and decode() must accept it.
+    #[test]
+    fn checksum_all_zero_fields_roundtrip() {
+        let msg = build_ping(0, 0);
+        let buf = msg.encode().unwrap();
+        // Checksum must be non-zero (kind byte = PING = 0x02, so data ≠ 0).
+        let stored =
+            u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
+        assert_ne!(stored, 0, "checksum of a non-zero buffer must not be 0");
+        assert!(Message::decode(&buf).is_ok());
     }
 
     #[test]
