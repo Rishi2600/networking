@@ -225,6 +225,10 @@ async fn handle_message(
     msg: gossip_membership::message::Message,
     from_addr: SocketAddr,
 ) {
+    // If this sender was previously known only as a bootstrap placeholder,
+    // remove that stale entry before inserting the real one.
+    node.table.remove_placeholder_for_addr(from_addr, msg.sender_id);
+
     // Any message from a node proves it is alive — record liveness from header.
     let sender_alive = gossip_membership::node::NodeState::new_alive(
         msg.sender_id,
