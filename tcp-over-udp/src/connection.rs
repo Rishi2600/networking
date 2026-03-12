@@ -426,7 +426,7 @@ impl Connection {
                         // wait; ACK it so their stop-and-wait doesn't stall.
                         if !pkt.payload.is_empty() {
                             self.receiver.on_segment(pkt.header.seq, &pkt.payload);
-                            let ack = self.make_ack();
+                            let ack = Self::make_ack(self);
                             let _ = self.socket.send_to(&ack, self.peer).await;
                         }
                     }
@@ -478,7 +478,7 @@ impl Connection {
             if h.flags & flags::FIN != 0 {
                 // FIN consumes one sequence number; ACK it.
                 self.receiver.on_fin(h.seq);
-                let ack = self.make_ack();
+                let ack = Self::make_ack(self);
                 let _ = self.socket.send_to(&ack, self.peer).await;
                 self.state = ConnectionState::CloseWait;
                 log::debug!("← FIN seq={}; → ACK ack={}", h.seq, self.receiver.ack_number());
@@ -491,7 +491,7 @@ impl Connection {
             }
 
             let accepted = self.receiver.on_segment(h.seq, &pkt.payload);
-            let ack = self.make_ack();
+            let ack = Self::make_ack(self);
             self.socket.send_to(&ack, self.peer).await?;
             log::debug!(
                 "← DATA seq={} len={} accepted={}; → ACK ack={}",
@@ -594,6 +594,7 @@ impl Connection {
         log::debug!("→ RST (abort) seq={}", rst.header.seq);
         self.state = ConnectionState::Closed;
         Ok(())
+    }
     // Window Scale Accessors
     // -----------------------------------------------------------------------
 

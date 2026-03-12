@@ -57,7 +57,7 @@ async fn test_rst_on_unexpected_syn_in_established() {
         let sock = ephemeral().await;
         // Complete the handshake, then decompose to get the raw socket.
         let conn = Connection::connect(sock, server_addr).await.expect("connect");
-        let (_state, socket, peer, _next_seq, _rcv_nxt, _rto, _mss) = conn.into_parts();
+        let (_state, socket, peer, _next_seq, _rcv_nxt, _rto, _mss, _, _) = conn.into_parts();
 
         // Send a bare SYN from the client's address — the server will see it
         // as coming from its known peer.
@@ -113,7 +113,7 @@ async fn test_rst_on_implausible_seq() {
     let client = tokio::spawn(async move {
         let sock = ephemeral().await;
         let conn = Connection::connect(sock, server_addr).await.expect("connect");
-        let (_state, socket, peer, _next_seq, _rcv_nxt, _rto, _mss) = conn.into_parts();
+        let (_state, socket, peer, _next_seq, _rcv_nxt, _rto, _mss, _, _) = conn.into_parts();
 
         // Send a data segment with a wildly wrong sequence number from the
         // client's address.  The server's rcv_nxt is near the client's ISN+1;
