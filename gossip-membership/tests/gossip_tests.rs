@@ -113,11 +113,21 @@ pub async fn run_test_node(
             }
 
             _ = gossip_tick.tick() => {
-                if let Some((_, peer_addr)) = gossip::pick_random_peer(&node.table, node.id) {
-                    let msg = gossip::build_gossip_message(
-                        &node.table, node.id, node.table.our_heartbeat(), node.table.our_incarnation(), node.config.gossip_fanout,
+                let targets = gossip::pick_gossip_targets(
+                    &node.table, node.id, node.config.max_gossip_sends,
+                );
+                if !targets.is_empty() {
+                    let fanout = gossip::effective_fanout(
+                        node.config.gossip_fanout,
+                        node.table.entries.len(),
+                        node.config.adaptive_fanout,
                     );
-                    let _ = node.transport.send_to(&msg, peer_addr).await;
+                    let msg = gossip::build_gossip_message(
+                        &node.table, node.id, node.table.our_heartbeat(), node.table.our_incarnation(), fanout,
+                    );
+                    for (_, peer_addr) in &targets {
+                        let _ = node.transport.send_to(&msg, *peer_addr).await;
+                    }
                 }
             }
 
@@ -937,4 +947,72 @@ async fn test_plaintext_node_rejected_by_encrypted_cluster() {
         !node2.table.entries.values().any(|e| e.node_id == id1),
         "plaintext node should NOT parse encrypted messages"
     );
+}
+
+// ── Rate-limiting / adaptive-fanout tests ───────────────────────────────────
+
+/// With max_gossip_sends=2, a five-node star topology should converge
+/// at least as fast as with max_gossip_sends=1.
+#[tokio::test]
+async fn test_multi_target_gossip_converges() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.max_gossip_sends = 2;
+    cfg.adaptive_fanout = true;
+
+    let hub_transport = bind_local().await;
+    let hub_addr = hub_transport.local_addr;
+
+    let mut transports = vec![hub_transport];
+    for _ in 0..4 {
+        transports.push(bind_local().await);
+    }
+    let addrs: Vec<_> = transports.iter().map(|t| t.local_addr).collect();
+
+    let nodes: Vec<TestNode> = transports
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let peers: Vec<SocketAddr> = if i == 0 {
+                addrs[1..].to_vec()
+            } else {
+                vec![hub_addr]
+            };
+            TestNode::new(t, cfg.clone(), &peers)
+        })
+        .collect();
+
+    let ids: Vec<u64> = nodes.iter().map(|n| n.id).collect();
+
+    let mut handles = Vec::new();
+    let mut senders = Vec::new();
+    for node in nodes {
+        let (tx, rx) = oneshot::channel();
+        senders.push(tx);
+        handles.push(tokio::spawn(run_test_node(node, rx)));
+    }
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    for tx in senders {
+        let _ = tx.send(());
+    }
+
+    let final_nodes: Vec<TestNode> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    for (i, node) in final_nodes.iter().enumerate() {
+        for (j, &expected_id) in ids.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            assert!(
+                node.table.entries.values().any(|e| e.node_id == expected_id),
+                "node[{i}] does not know about node[{j}] (id={expected_id})"
+            );
+        }
+    }
 }

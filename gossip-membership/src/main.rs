@@ -126,27 +126,37 @@ pub async fn run_node(
                 );
             }
 
-            // ── Branch 3: gossip round ─────────────────────────────────────────
+            // ── Branch 3: gossip round (rate-limited) ─────────────────────────
             _ = gossip_tick.tick() => {
-                if let Some((peer_id, peer_addr)) =
-                    gossip::pick_random_peer(&node.table, node.id)
-                {
+                let targets = gossip::pick_gossip_targets(
+                    &node.table,
+                    node.id,
+                    node.config.max_gossip_sends,
+                );
+                if !targets.is_empty() {
+                    let fanout = gossip::effective_fanout(
+                        node.config.gossip_fanout,
+                        node.table.entries.len(),
+                        node.config.adaptive_fanout,
+                    );
                     let msg = gossip::build_gossip_message(
                         &node.table,
                         node.id,
                         node.table.our_heartbeat(),
                         node.table.our_incarnation(),
-                        node.config.gossip_fanout,
+                        fanout,
                     );
-                    match node.transport.send_to(&msg, peer_addr).await {
-                        Ok(()) => log::debug!(
-                            "[node {}] gossip → peer {} @ {}",
-                            node.id, peer_id, peer_addr
-                        ),
-                        Err(e) => log::warn!(
-                            "[node {}] gossip send failed to {peer_addr}: {e}",
-                            node.id
-                        ),
+                    for (peer_id, peer_addr) in &targets {
+                        match node.transport.send_to(&msg, *peer_addr).await {
+                            Ok(()) => log::debug!(
+                                "[node {}] gossip → peer {} @ {}",
+                                node.id, peer_id, peer_addr
+                            ),
+                            Err(e) => log::warn!(
+                                "[node {}] gossip send failed to {peer_addr}: {e}",
+                                node.id
+                            ),
+                        }
                     }
                 }
             }

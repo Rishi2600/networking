@@ -107,8 +107,16 @@ pub struct NodeConfig {
     pub suspect_timeout_jitter_ms: u64,
     /// Number of indirect probers to use (k in SWIM).
     pub indirect_probe_k: usize,
-    /// Max entries to include in one GOSSIP message.
+    /// Base max entries to include in one GOSSIP message.
     pub gossip_fanout: usize,
+    /// When `true`, effective fanout scales with cluster size:
+    /// `base_fanout * ceil(log2(n))`.  This ensures information spreads in
+    /// O(log n) rounds even as the cluster grows.
+    pub adaptive_fanout: bool,
+    /// Max gossip messages to send per gossip round.  Capped at the number
+    /// of live peers.  Setting this to 1 gives classic single-target gossip;
+    /// higher values increase dissemination speed at the cost of bandwidth.
+    pub max_gossip_sends: usize,
     /// How long after becoming Dead before an entry is garbage-collected (ms).
     pub dead_retention_ms: u64,
     /// Max membership entries to piggyback on PING/ACK messages.
@@ -127,6 +135,8 @@ impl Default for NodeConfig {
             suspect_timeout_jitter_ms: 1_000,
             indirect_probe_k: 2,
             gossip_fanout: 50,
+            adaptive_fanout: true,
+            max_gossip_sends: 1,
             dead_retention_ms: 15_000,
             piggyback_max: 6,
         }
@@ -146,6 +156,8 @@ impl NodeConfig {
             suspect_timeout_jitter_ms: 50,
             indirect_probe_k: 2,
             gossip_fanout: 50,
+            adaptive_fanout: true,
+            max_gossip_sends: 1,
             dead_retention_ms: 1_000,
             piggyback_max: 6,
         }
