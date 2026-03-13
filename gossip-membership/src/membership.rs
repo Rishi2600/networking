@@ -408,29 +408,23 @@ impl MembershipTable {
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
-/// Convert a `NodeState` to a wire entry. Returns `None` for non-IPv4 addresses.
+/// Convert a `NodeState` to a wire entry (supports both IPv4 and IPv6).
 pub fn node_state_to_wire(s: &NodeState) -> Option<WireNodeEntry> {
-    let (ip, port) = match s.addr {
-        SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
-        SocketAddr::V6(_) => return None, // IPv6 not supported in this wire format.
-    };
     Some(WireNodeEntry {
         node_id: s.node_id,
         heartbeat: s.heartbeat,
         incarnation: s.incarnation,
         status: s.status.to_wire(),
-        ip,
-        port,
+        addr: s.addr,
     })
 }
 
 /// Convert a received wire entry into a local `NodeState`.
 pub fn wire_to_node_state(e: &WireNodeEntry) -> Option<NodeState> {
-    let addr = std::net::SocketAddr::V4(e.addr());
     let status = NodeStatus::from_wire(e.status)?;
     Some(NodeState {
         node_id: e.node_id,
-        addr,
+        addr: e.addr,
         heartbeat: e.heartbeat,
         incarnation: e.incarnation,
         status,

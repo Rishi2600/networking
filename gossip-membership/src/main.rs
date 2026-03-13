@@ -148,10 +148,7 @@ pub async fn run_node(
                 for target_id in scan.escalate_to_indirect {
                     // Direct probe timed out; send PING_REQ to k intermediaries.
                     if let Some(target_state) = node.table.entries.get(&target_id) {
-                        let target_addr = match target_state.addr {
-                            SocketAddr::V4(a) => a,
-                            _ => continue,
-                        };
+                        let target_addr = target_state.addr;
                         let intermediaries = gossip::pick_k_random_peers(
                             &node.table,
                             node.id,
@@ -279,7 +276,7 @@ async fn handle_message(
             // Forward a PING to the target on behalf of the requester.
             // We do not wait for or forward the ACK — the requester has its
             // own timeout and will receive the ACK directly if the target is alive.
-            let target_addr = SocketAddr::V4(req.target_addr);
+            let target_addr = req.target_addr;
             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
             let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
             if let Err(e) = node.transport.send_to(&ping, target_addr).await {

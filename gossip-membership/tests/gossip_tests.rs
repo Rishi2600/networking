@@ -95,7 +95,7 @@ pub async fn run_test_node(
                         MessagePayload::PingReq(req) => {
                             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
                             let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
-                            let _ = node.transport.send_to(&ping, SocketAddr::V4(req.target_addr)).await;
+                            let _ = node.transport.send_to(&ping, req.target_addr).await;
                         }
                         MessagePayload::Ack(entries) => {
                             if !entries.is_empty() {
@@ -125,17 +125,16 @@ pub async fn run_test_node(
                 let scan = node.failure_det.scan(Instant::now());
                 for id in scan.escalate_to_indirect {
                     if let Some(target_state) = node.table.entries.get(&id) {
-                        if let SocketAddr::V4(target_addr) = target_state.addr {
-                            let intermediaries = gossip::pick_k_random_peers(
-                                &node.table, node.id, id, node.config.indirect_probe_k,
-                            );
-                            for (_, inter_addr) in &intermediaries {
-                                let req = build_ping_req(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), id, target_addr);
-                                let _ = node.transport.send_to(&req, *inter_addr).await;
-                            }
-                            if !intermediaries.is_empty() {
-                                node.failure_det.record_indirect_probe_sent(id);
-                            }
+                        let target_addr = target_state.addr;
+                        let intermediaries = gossip::pick_k_random_peers(
+                            &node.table, node.id, id, node.config.indirect_probe_k,
+                        );
+                        for (_, inter_addr) in &intermediaries {
+                            let req = build_ping_req(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), id, target_addr);
+                            let _ = node.transport.send_to(&req, *inter_addr).await;
+                        }
+                        if !intermediaries.is_empty() {
+                            node.failure_det.record_indirect_probe_sent(id);
                         }
                     }
                 }
@@ -440,8 +439,7 @@ async fn test_gossip_message_encode_decode() {
         heartbeat: 7,
         incarnation: 0,
         status: status::ALIVE,
-        ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
-        port: 8080,
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
     };
     let msg = build_gossip(42, 3, 0, vec![entry.clone()]);
     let buf = msg.encode().unwrap();

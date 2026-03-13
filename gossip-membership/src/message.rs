@@ -14,7 +14,7 @@
 /// ```
 ///
 /// All multi-byte integers are big-endian (network byte order).
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 // ── Header byte offsets ──────────────────────────────────────────────────────
 pub const OFF_KIND: usize = 0;
@@ -46,18 +46,33 @@ pub mod status {
     pub const DEAD: u8 = 2;
 }
 
+// ── Address family tags ──────────────────────────────────────────────────────
+pub mod addr_family {
+    pub const V4: u8 = 4;
+    pub const V6: u8 = 6;
+}
+
 // ── Wire-level node entry ────────────────────────────────────────────────────
-/// One membership record on the wire (23 bytes, IPv4 only).
+/// One membership record on the wire (variable length: 24 bytes for IPv4,
+/// 36 bytes for IPv6).
 ///
 /// ```text
-///  Bytes  0-7  : node_id     (u64)
-///  Bytes  8-11 : heartbeat   (u32)
-///  Bytes 12-15 : incarnation (u32) — SWIM incarnation number
-///  Byte   16   : status      (u8)  — 0=Alive, 1=Suspect, 2=Dead
-///  Bytes 17-20 : ip          (u32) — IPv4 address, big-endian
-///  Bytes 21-22 : port        (u16)
+///  Bytes  0-7  : node_id      (u64)
+///  Bytes  8-11 : heartbeat    (u32)
+///  Bytes 12-15 : incarnation  (u32) — SWIM incarnation number
+///  Byte   16   : status       (u8)  — 0=Alive, 1=Suspect, 2=Dead
+///  Byte   17   : addr_family  (u8)  — 4=IPv4, 6=IPv6
+///  Bytes 18+   : addr bytes
+///    IPv4: 4 bytes IP + 2 bytes port  = 6 bytes  → total 24
+///    IPv6: 16 bytes IP + 2 bytes port = 18 bytes → total 36
 /// ```
-pub const NODE_ENTRY_LEN: usize = 23;
+
+/// Fixed prefix before the address family tag.
+const NODE_ENTRY_PREFIX: usize = 18;
+/// Total wire length of an IPv4 node entry.
+pub const NODE_ENTRY_V4_LEN: usize = 24;
+/// Total wire length of an IPv6 node entry.
+pub const NODE_ENTRY_V6_LEN: usize = 36;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireNodeEntry {
@@ -65,8 +80,7 @@ pub struct WireNodeEntry {
     pub heartbeat: u32,
     pub incarnation: u32,
     pub status: u8,
-    pub ip: u32,
-    pub port: u16,
+    pub addr: SocketAddr,
 }
 
 impl WireNodeEntry {
@@ -75,58 +89,136 @@ impl WireNodeEntry {
         buf.extend_from_slice(&self.heartbeat.to_be_bytes());
         buf.extend_from_slice(&self.incarnation.to_be_bytes());
         buf.push(self.status);
-        buf.extend_from_slice(&self.ip.to_be_bytes());
-        buf.extend_from_slice(&self.port.to_be_bytes());
+        encode_addr(&self.addr, buf);
     }
 
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < NODE_ENTRY_LEN {
+    /// Decode from the start of `buf`. Returns the entry and number of bytes
+    /// consumed, or `None` if the buffer is too short or the address family
+    /// is unrecognised.
+    pub fn decode(buf: &[u8]) -> Option<(Self, usize)> {
+        if buf.len() < NODE_ENTRY_PREFIX {
             return None;
         }
-        Some(Self {
-            node_id: u64::from_be_bytes(buf[0..8].try_into().ok()?),
-            heartbeat: u32::from_be_bytes(buf[8..12].try_into().ok()?),
-            incarnation: u32::from_be_bytes(buf[12..16].try_into().ok()?),
-            status: buf[16],
-            ip: u32::from_be_bytes(buf[17..21].try_into().ok()?),
-            port: u16::from_be_bytes(buf[21..23].try_into().ok()?),
-        })
+        let node_id = u64::from_be_bytes(buf[0..8].try_into().ok()?);
+        let heartbeat = u32::from_be_bytes(buf[8..12].try_into().ok()?);
+        let incarnation = u32::from_be_bytes(buf[12..16].try_into().ok()?);
+        let status_byte = buf[16];
+        let af = buf[17];
+        let (addr, total) = match af {
+            addr_family::V4 => {
+                if buf.len() < NODE_ENTRY_V4_LEN {
+                    return None;
+                }
+                let ip = Ipv4Addr::new(buf[18], buf[19], buf[20], buf[21]);
+                let port = u16::from_be_bytes(buf[22..24].try_into().ok()?);
+                (SocketAddr::new(IpAddr::V4(ip), port), NODE_ENTRY_V4_LEN)
+            }
+            addr_family::V6 => {
+                if buf.len() < NODE_ENTRY_V6_LEN {
+                    return None;
+                }
+                let octets: [u8; 16] = buf[18..34].try_into().ok()?;
+                let ip = Ipv6Addr::from(octets);
+                let port = u16::from_be_bytes(buf[34..36].try_into().ok()?);
+                (SocketAddr::new(IpAddr::V6(ip), port), NODE_ENTRY_V6_LEN)
+            }
+            _ => return None,
+        };
+        Some((
+            Self {
+                node_id,
+                heartbeat,
+                incarnation,
+                status: status_byte,
+                addr,
+            },
+            total,
+        ))
     }
 
-    pub fn addr(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::from(self.ip), self.port)
+    /// Wire length of this entry (depends on address family).
+    pub fn wire_len(&self) -> usize {
+        match self.addr {
+            SocketAddr::V4(_) => NODE_ENTRY_V4_LEN,
+            SocketAddr::V6(_) => NODE_ENTRY_V6_LEN,
+        }
     }
 }
 
 // ── PING_REQ payload ─────────────────────────────────────────────────────────
-/// Carries the address of the node we want an intermediary to probe (14 bytes).
-pub const PING_REQ_PAYLOAD_LEN: usize = 14;
+/// Carries the target node ID + target socket address.
+///
+/// ```text
+///  Bytes 0-7  : target_id    (u64)
+///  Byte  8    : addr_family  (u8)
+///  Bytes 9+   : addr bytes   (IPv4: 6 bytes → total 15, IPv6: 18 bytes → total 27)
+/// ```
 
 #[derive(Debug, Clone)]
 pub struct PingReqPayload {
     pub target_id: u64,
-    pub target_addr: SocketAddrV4,
+    pub target_addr: SocketAddr,
 }
 
 impl PingReqPayload {
     fn encode_into(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.target_id.to_be_bytes());
-        let ip: u32 = (*self.target_addr.ip()).into();
-        buf.extend_from_slice(&ip.to_be_bytes());
-        buf.extend_from_slice(&self.target_addr.port().to_be_bytes());
+        encode_addr(&self.target_addr, buf);
     }
 
-    fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < PING_REQ_PAYLOAD_LEN {
+    fn decode(buf: &[u8]) -> Option<(Self, usize)> {
+        if buf.len() < 9 {
             return None;
         }
         let target_id = u64::from_be_bytes(buf[0..8].try_into().ok()?);
-        let ip = u32::from_be_bytes(buf[8..12].try_into().ok()?);
-        let port = u16::from_be_bytes(buf[12..14].try_into().ok()?);
-        Some(Self {
-            target_id,
-            target_addr: SocketAddrV4::new(Ipv4Addr::from(ip), port),
-        })
+        let (addr, addr_len) = decode_addr(&buf[8..])?;
+        Some((
+            Self { target_id, target_addr: addr },
+            8 + addr_len,
+        ))
+    }
+}
+
+// ── Address encode / decode helpers ─────────────────────────────────────────
+fn encode_addr(addr: &SocketAddr, buf: &mut Vec<u8>) {
+    match addr {
+        SocketAddr::V4(a) => {
+            buf.push(addr_family::V4);
+            buf.extend_from_slice(&a.ip().octets());
+            buf.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
+            buf.push(addr_family::V6);
+            buf.extend_from_slice(&a.ip().octets());
+            buf.extend_from_slice(&a.port().to_be_bytes());
+        }
+    }
+}
+
+/// Decode an address from `buf`. Returns `(SocketAddr, bytes_consumed)`.
+fn decode_addr(buf: &[u8]) -> Option<(SocketAddr, usize)> {
+    if buf.is_empty() {
+        return None;
+    }
+    match buf[0] {
+        addr_family::V4 => {
+            if buf.len() < 7 {
+                return None;
+            }
+            let ip = Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+            let port = u16::from_be_bytes(buf[5..7].try_into().ok()?);
+            Some((SocketAddr::new(IpAddr::V4(ip), port), 7))
+        }
+        addr_family::V6 => {
+            if buf.len() < 19 {
+                return None;
+            }
+            let octets: [u8; 16] = buf[1..17].try_into().ok()?;
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes(buf[17..19].try_into().ok()?);
+            Some((SocketAddr::new(IpAddr::V6(ip), port), 19))
+        }
+        _ => None,
     }
 }
 
@@ -142,18 +234,15 @@ pub enum MessagePayload {
 }
 
 /// Parse a payload buffer into a vector of `WireNodeEntry`.
-/// Returns `Err` if the buffer length is not a multiple of `NODE_ENTRY_LEN`.
+/// Entries are variable-length (IPv4 vs IPv6), so we consume one at a time.
 fn parse_node_entries(buf: &[u8]) -> Result<Vec<WireNodeEntry>, MessageError> {
-    if buf.len() % NODE_ENTRY_LEN != 0 {
-        return Err(MessageError::MalformedPayload);
-    }
-    let mut entries = Vec::with_capacity(buf.len() / NODE_ENTRY_LEN);
+    let mut entries = Vec::new();
     let mut off = 0;
-    while off + NODE_ENTRY_LEN <= buf.len() {
-        let entry =
+    while off < buf.len() {
+        let (entry, consumed) =
             WireNodeEntry::decode(&buf[off..]).ok_or(MessageError::MalformedPayload)?;
         entries.push(entry);
-        off += NODE_ENTRY_LEN;
+        off += consumed;
     }
     Ok(entries)
 }
@@ -301,11 +390,11 @@ impl Message {
                 MessagePayload::Ping(parse_node_entries(payload_buf)?)
             }
             kind::PING_REQ => {
-                if payload_len != PING_REQ_PAYLOAD_LEN {
+                let (p, consumed) =
+                    PingReqPayload::decode(payload_buf).ok_or(MessageError::MalformedPayload)?;
+                if consumed != payload_len {
                     return Err(MessageError::MalformedPayload);
                 }
-                let p =
-                    PingReqPayload::decode(payload_buf).ok_or(MessageError::MalformedPayload)?;
                 MessagePayload::PingReq(p)
             }
             kind::ACK => {
@@ -363,7 +452,7 @@ pub fn build_ping_req(
     sender_heartbeat: u32,
     sender_incarnation: u32,
     target_id: u64,
-    target_addr: SocketAddrV4,
+    target_addr: SocketAddr,
 ) -> Message {
     Message {
         kind: kind::PING_REQ,
@@ -397,7 +486,15 @@ pub fn build_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    fn v4(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), port)
+    }
+
+    fn v6(ip: [u8; 16], port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)
+    }
 
     #[test]
     fn roundtrip_gossip_empty() {
@@ -416,8 +513,7 @@ mod tests {
             heartbeat: 5,
             incarnation: 0,
             status: status::ALIVE,
-            ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
-            port: 8080,
+            addr: v4([127, 0, 0, 1], 8080),
         };
         let msg = build_gossip(1, 2, 0, vec![entry.clone()]);
         let buf = msg.encode().unwrap();
@@ -428,6 +524,55 @@ mod tests {
                 assert_eq!(entries[0], entry);
             }
             _ => panic!("wrong payload kind"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_gossip_ipv6_entry() {
+        let entry = WireNodeEntry {
+            node_id: 42,
+            heartbeat: 10,
+            incarnation: 1,
+            status: status::ALIVE,
+            addr: v6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 7000),
+        };
+        let msg = build_gossip(1, 2, 0, vec![entry.clone()]);
+        let buf = msg.encode().unwrap();
+        assert_eq!(buf.len(), HEADER_LEN + NODE_ENTRY_V6_LEN);
+        let decoded = Message::decode(&buf).unwrap();
+        match decoded.payload {
+            MessagePayload::Gossip(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0], entry);
+            }
+            _ => panic!("wrong payload kind"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_mixed_v4_v6_entries() {
+        let v4_entry = WireNodeEntry {
+            node_id: 1,
+            heartbeat: 5,
+            incarnation: 0,
+            status: status::ALIVE,
+            addr: v4([10, 0, 0, 1], 8000),
+        };
+        let v6_entry = WireNodeEntry {
+            node_id: 2,
+            heartbeat: 3,
+            incarnation: 0,
+            status: status::SUSPECT,
+            addr: v6([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 9000),
+        };
+        let entries = vec![v4_entry.clone(), v6_entry.clone()];
+        let msg = build_gossip(7, 42, 0, entries.clone());
+        let buf = msg.encode().unwrap();
+        assert_eq!(buf.len(), HEADER_LEN + NODE_ENTRY_V4_LEN + NODE_ENTRY_V6_LEN);
+        let decoded = Message::decode(&buf).unwrap();
+        match decoded.payload {
+            MessagePayload::Gossip(got) => assert_eq!(got, entries),
+            _ => panic!("wrong payload"),
         }
     }
 
@@ -447,8 +592,7 @@ mod tests {
             heartbeat: 3,
             incarnation: 1,
             status: status::SUSPECT,
-            ip: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
-            port: 7000,
+            addr: v4([10, 0, 0, 1], 7000),
         };
         let msg = build_ping(1, 3, 0, vec![entry.clone()]);
         let buf = msg.encode().unwrap();
@@ -463,14 +607,29 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_ping_req() {
-        let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000);
+    fn roundtrip_ping_req_v4() {
+        let addr = v4([10, 0, 0, 1], 9000);
         let msg = build_ping_req(1, 2, 0, 77, addr);
         let buf = msg.encode().unwrap();
         let decoded = Message::decode(&buf).unwrap();
         match decoded.payload {
             MessagePayload::PingReq(p) => {
                 assert_eq!(p.target_id, 77);
+                assert_eq!(p.target_addr, addr);
+            }
+            _ => panic!("wrong payload kind"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_ping_req_v6() {
+        let addr = v6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 8000);
+        let msg = build_ping_req(1, 2, 0, 88, addr);
+        let buf = msg.encode().unwrap();
+        let decoded = Message::decode(&buf).unwrap();
+        match decoded.payload {
+            MessagePayload::PingReq(p) => {
+                assert_eq!(p.target_id, 88);
                 assert_eq!(p.target_addr, addr);
             }
             _ => panic!("wrong payload kind"),
@@ -492,8 +651,7 @@ mod tests {
             heartbeat: 12,
             incarnation: 2,
             status: status::DEAD,
-            ip: u32::from(Ipv4Addr::new(192, 168, 1, 1)),
-            port: 5000,
+            addr: v4([192, 168, 1, 1], 5000),
         };
         let msg = build_ack(5, 10, 0, vec![entry.clone()]);
         let buf = msg.encode().unwrap();
@@ -511,7 +669,6 @@ mod tests {
     fn checksum_catches_corruption() {
         let msg = build_ping(1, 1, 0, vec![]);
         let mut buf = msg.encode().unwrap();
-        // Flip a bit in the sender ID field.
         buf[OFF_SENDER_ID] ^= 0xFF;
         let result = Message::decode(&buf);
         assert!(result.is_err());
@@ -528,7 +685,6 @@ mod tests {
         let mut msg = build_ping(1, 1, 0, vec![]);
         msg.kind = 0xFF;
         let mut buf = msg.encode().unwrap();
-        // Fix the checksum after changing kind in buf.
         buf[OFF_KIND] = 0xFF;
         buf[OFF_CHECKSUM] = 0;
         buf[OFF_CHECKSUM + 1] = 0;
@@ -540,7 +696,6 @@ mod tests {
 
     // ── Checksum-specific tests ───────────────────────────────────────────────
 
-    /// A correctly encoded packet must always be accepted.
     #[test]
     fn checksum_valid_packet_accepted() {
         for msg in [
@@ -552,8 +707,7 @@ mod tests {
                 heartbeat: 0,
                 incarnation: 0,
                 status: status::ALIVE,
-                ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
-                port: 9000,
+                addr: v4([127, 0, 0, 1], 9000),
             }]),
         ] {
             let buf = msg.encode().unwrap();
@@ -564,16 +718,12 @@ mod tests {
         }
     }
 
-    /// Every single-byte corruption must be detected.
     #[test]
     fn checksum_single_byte_corruption_rejected() {
         let buf = build_ping(0xDEADBEEF_CAFEBABE, 42, 0, vec![])
             .encode()
             .unwrap();
-        // Flip each byte individually; every flip must cause a decode failure.
         for i in 0..buf.len() {
-            // Flipping the checksum field itself is a special case: the stored
-            // value is wrong, so the full-buffer sum will no longer be 0x0000.
             let mut corrupted = buf.clone();
             corrupted[i] ^= 0xFF;
             assert!(
@@ -583,30 +733,22 @@ mod tests {
         }
     }
 
-    /// A packet with a zero stored checksum is only valid if the data happens
-    /// to sum to 0xFFFF (i.e. the correct checksum really is 0x0000).
-    /// A zero checksum on arbitrary data must be rejected.
     #[test]
     fn checksum_zero_stored_value_rejected_when_data_nonzero() {
         let msg = build_ping(1, 1, 0, vec![]);
         let mut buf = msg.encode().unwrap();
-        // Overwrite the stored checksum with 0x0000.
         buf[OFF_CHECKSUM] = 0x00;
         buf[OFF_CHECKSUM + 1] = 0x00;
-        // The data is non-trivial, so the full-buffer sum won't be 0x0000.
         assert!(
             Message::decode(&buf).is_err(),
             "zero checksum on non-zero data must be rejected"
         );
     }
 
-    /// Edge case: sender_id = 0, heartbeat = 0 (all-zero fields).
-    /// encode() must produce a non-trivial checksum and decode() must accept it.
     #[test]
     fn checksum_all_zero_fields_roundtrip() {
         let msg = build_ping(0, 0, 0, vec![]);
         let buf = msg.encode().unwrap();
-        // Checksum must be non-zero (kind byte = PING = 0x02, so data ≠ 0).
         let stored =
             u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
         assert_ne!(stored, 0, "checksum of a non-zero buffer must not be 0");
@@ -621,13 +763,12 @@ mod tests {
                 heartbeat: i as u32 * 3,
                 incarnation: i as u32,
                 status: (i % 3) as u8,
-                ip: u32::from(Ipv4Addr::new(192, 168, 1, i as u8)),
-                port: 9000 + i as u16,
+                addr: v4([192, 168, 1, i as u8], 9000 + i as u16),
             })
             .collect();
         let msg = build_gossip(7, 42, 0, entries.clone());
         let buf = msg.encode().unwrap();
-        assert_eq!(buf.len(), HEADER_LEN + 10 * NODE_ENTRY_LEN);
+        assert_eq!(buf.len(), HEADER_LEN + 10 * NODE_ENTRY_V4_LEN);
         let decoded = Message::decode(&buf).unwrap();
         match decoded.payload {
             MessagePayload::Gossip(got) => assert_eq!(got, entries),
