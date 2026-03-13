@@ -93,8 +93,18 @@ pub struct NodeConfig {
     pub probe_interval_ms: u64,
     /// Probe timeout: how long to wait for an ACK before escalating (ms).
     pub probe_timeout_ms: u64,
-    /// Suspect timeout: how long a Suspect node stays Suspect before becoming Dead (ms).
+    /// Suspect timeout base: how long a Suspect node stays Suspect before becoming Dead (ms).
     pub suspect_timeout_ms: u64,
+    /// Log-scaling multiplier for the suspect timeout.  Effective timeout is
+    /// `base * (1 + multiplier * log2(cluster_size))`, so larger clusters wait
+    /// proportionally longer before declaring Dead — matching SWIM's O(log n)
+    /// protocol period.
+    pub suspect_timeout_multiplier: f64,
+    /// Maximum random jitter (ms) added to the suspect timeout.  Each
+    /// observer-suspect pair gets a deterministic offset derived from
+    /// `hash(local_id, suspect_id)`, desynchronising Dead declarations across
+    /// the cluster and preventing a thundering herd of concurrent state changes.
+    pub suspect_timeout_jitter_ms: u64,
     /// Number of indirect probers to use (k in SWIM).
     pub indirect_probe_k: usize,
     /// Max entries to include in one GOSSIP message.
@@ -113,6 +123,8 @@ impl Default for NodeConfig {
             probe_interval_ms: 1_000,
             probe_timeout_ms: 500,
             suspect_timeout_ms: 3_000,
+            suspect_timeout_multiplier: 0.5,
+            suspect_timeout_jitter_ms: 1_000,
             indirect_probe_k: 2,
             gossip_fanout: 50,
             dead_retention_ms: 15_000,
@@ -130,6 +142,8 @@ impl NodeConfig {
             probe_interval_ms: 100,
             probe_timeout_ms: 100,
             suspect_timeout_ms: 300,
+            suspect_timeout_multiplier: 0.5,
+            suspect_timeout_jitter_ms: 50,
             indirect_probe_k: 2,
             gossip_fanout: 50,
             dead_retention_ms: 1_000,

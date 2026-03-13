@@ -141,7 +141,11 @@ pub async fn run_test_node(
                 for id in scan.declare_suspect {
                     node.table.suspect(id);
                 }
-                for id in node.table.expired_suspects(Duration::from_millis(node.config.suspect_timeout_ms)) {
+                for id in node.table.expired_suspects_jittered(
+                    node.config.suspect_timeout_ms,
+                    node.config.suspect_timeout_multiplier,
+                    node.config.suspect_timeout_jitter_ms,
+                ) {
                     node.table.declare_dead(id);
                 }
                 node.table.gc_dead(Duration::from_millis(node.config.dead_retention_ms));

@@ -181,9 +181,12 @@ pub async fn run_node(
                     node.table.suspect(id);
                 }
 
-                // Step 2: promote expired Suspects to Dead.
-                for id in node.table.expired_suspects(
-                    Duration::from_millis(node.config.suspect_timeout_ms),
+                // Step 2: promote expired Suspects to Dead (jittered to
+                // desynchronise declarations across the cluster).
+                for id in node.table.expired_suspects_jittered(
+                    node.config.suspect_timeout_ms,
+                    node.config.suspect_timeout_multiplier,
+                    node.config.suspect_timeout_jitter_ms,
                 ) {
                     node.table.declare_dead(id);
                 }

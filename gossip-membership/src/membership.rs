@@ -1,6 +1,8 @@
 /// Membership table: stores the cluster-wide view of node state and implements
 /// the gossip merge rules.
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -259,6 +261,46 @@ impl MembershipTable {
             .collect()
     }
 
+    /// Compute the effective suspect timeout scaled by cluster size.
+    ///
+    /// Formula: `base * (1 + multiplier * log2(n))` where `n` is the number
+    /// of known entries.  This matches SWIM's O(log n) protocol period scaling
+    /// so larger clusters tolerate higher latency before declaring Dead.
+    pub fn suspect_timeout(&self, base_ms: u64, multiplier: f64) -> Duration {
+        let n = self.entries.len().max(1) as f64;
+        let scale = 1.0 + multiplier * n.log2().max(0.0);
+        Duration::from_millis((base_ms as f64 * scale) as u64)
+    }
+
+    /// Return IDs of Suspects that have exceeded their jittered deadline.
+    ///
+    /// Each observer-suspect pair gets a deterministic jitter offset derived
+    /// from `hash(local_id, suspect_id) % jitter_ms`, so different nodes in
+    /// the cluster will promote the same suspect to Dead at staggered times.
+    /// This prevents a thundering herd of simultaneous Dead declarations.
+    pub fn expired_suspects_jittered(
+        &self,
+        base_ms: u64,
+        multiplier: f64,
+        jitter_ms: u64,
+    ) -> Vec<NodeId> {
+        let base = self.suspect_timeout(base_ms, multiplier);
+        let now = Instant::now();
+        self.entries
+            .values()
+            .filter(|e| {
+                e.status == NodeStatus::Suspect
+                    && e.suspect_since
+                        .map(|s| {
+                            let jitter = suspect_jitter(self.local_id, e.node_id, jitter_ms);
+                            now.duration_since(s) >= base + jitter
+                        })
+                        .unwrap_or(false)
+            })
+            .map(|e| e.node_id)
+            .collect()
+    }
+
     /// Remove Dead entries that have been dead for longer than `retention`.
     /// This prevents unbounded growth of the gossip digest.
     pub fn gc_dead(&mut self, retention: Duration) {
@@ -408,6 +450,24 @@ pub fn placeholder_id_for(addr: SocketAddr) -> NodeId {
     let mut h = DefaultHasher::new();
     addr.hash(&mut h);
     h.finish() ^ 0xDEAD_BEEF_0000_0000
+}
+
+// ── Suspect jitter ───────────────────────────────────────────────────────
+/// Deterministic per-observer-per-suspect jitter.
+///
+/// Returns a `Duration` in `[0, max_jitter_ms)` derived from
+/// `hash(observer_id, suspect_id)`.  Because each node in the cluster has a
+/// unique `observer_id`, the same suspect gets a different jitter offset on
+/// each observer, spreading out Dead declarations in time.
+fn suspect_jitter(observer_id: NodeId, suspect_id: NodeId, max_jitter_ms: u64) -> Duration {
+    if max_jitter_ms == 0 {
+        return Duration::ZERO;
+    }
+    let mut h = DefaultHasher::new();
+    observer_id.hash(&mut h);
+    suspect_id.hash(&mut h);
+    let jitter_ms = h.finish() % max_jitter_ms;
+    Duration::from_millis(jitter_ms)
 }
 
 // ── Heartbeat ordering ────────────────────────────────────────────────────────
@@ -841,5 +901,95 @@ mod tests {
         let count = t.entries.values().filter(|e| e.addr == make_addr(1000)).count();
         assert_eq!(count, 1, "only one entry for our own address");
         assert_eq!(t.entries[&1].addr, make_addr(1000));
+    }
+
+    // ── Suspect timeout scaling & jitter tests ───────────────────────────────
+
+    /// suspect_timeout scales with cluster size (log2).
+    #[test]
+    fn suspect_timeout_scales_with_cluster_size() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        // With only self (1 entry): log2(1) = 0, scale = 1.0.
+        let t1 = t.suspect_timeout(1000, 0.5);
+        assert_eq!(t1, Duration::from_millis(1000));
+
+        // Add 15 peers → 16 entries: log2(16) = 4, scale = 3.0.
+        // Use port offsets that don't collide with self (port 1000).
+        for i in 2..=16u64 {
+            t.merge_entry(&NodeState::new_alive(i, make_addr(2000 + i as u16), i as u32));
+        }
+        let t16 = t.suspect_timeout(1000, 0.5);
+        // Allow 50 ms tolerance for floating-point truncation.
+        assert!(
+            t16 >= Duration::from_millis(2950) && t16 <= Duration::from_millis(3050),
+            "expected ~3000 ms for 16 entries, got {t16:?}"
+        );
+
+        // Larger multiplier amplifies the scaling.
+        let t16_big = t.suspect_timeout(1000, 1.0);
+        assert!(
+            t16_big >= Duration::from_millis(4950) && t16_big <= Duration::from_millis(5050),
+            "expected ~5000 ms for 16 entries with multiplier=1.0, got {t16_big:?}"
+        );
+    }
+
+    /// Zero multiplier disables cluster-size scaling.
+    #[test]
+    fn suspect_timeout_zero_multiplier() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        for i in 2..=32u64 {
+            t.merge_entry(&NodeState::new_alive(i, make_addr(i as u16 * 100), i as u32));
+        }
+        let timeout = t.suspect_timeout(500, 0.0);
+        assert_eq!(timeout, Duration::from_millis(500));
+    }
+
+    /// suspect_jitter returns deterministic values in [0, max).
+    #[test]
+    fn suspect_jitter_deterministic_and_bounded() {
+        let j1 = suspect_jitter(1, 42, 1000);
+        let j2 = suspect_jitter(1, 42, 1000);
+        assert_eq!(j1, j2, "same inputs must produce same jitter");
+        assert!(j1 < Duration::from_millis(1000));
+    }
+
+    /// Different observers get different jitter for the same suspect,
+    /// ensuring Dead declarations are staggered.
+    #[test]
+    fn suspect_jitter_differs_across_observers() {
+        // Not guaranteed to differ for all pairs (hash collisions possible),
+        // but with these specific IDs it should.
+        let j_a = suspect_jitter(1, 99, 10_000);
+        let j_b = suspect_jitter(2, 99, 10_000);
+        // With 10 s range, two random offsets are extremely unlikely to match.
+        assert_ne!(j_a, j_b, "different observers should (almost always) get different jitter");
+    }
+
+    /// Zero jitter_ms produces zero duration (no division by zero).
+    #[test]
+    fn suspect_jitter_zero_max() {
+        assert_eq!(suspect_jitter(1, 2, 0), Duration::ZERO);
+    }
+
+    /// expired_suspects_jittered respects the jittered deadline.
+    #[test]
+    fn expired_suspects_jittered_basic() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        // Insert a suspect that became suspect 5 s ago.
+        let mut s = NodeState::new_alive(2, make_addr(2000), 1);
+        s.status = NodeStatus::Suspect;
+        s.suspect_since = Some(Instant::now() - Duration::from_secs(5));
+        t.entries.insert(2, s);
+
+        // With base=1000 ms, multiplier=0.0, jitter=0: effective ≈ 1 s.
+        // 5 s > 1 s → should be expired.
+        let expired = t.expired_suspects_jittered(1000, 0.0, 0);
+        assert!(expired.contains(&2), "suspect 5 s old must be expired with 1 s timeout");
+
+        // With base=10000 ms: effective ≈ 10 s.  5 s < 10 s → not expired.
+        let not_expired = t.expired_suspects_jittered(10_000, 0.0, 0);
+        assert!(!not_expired.contains(&2));
     }
 }
