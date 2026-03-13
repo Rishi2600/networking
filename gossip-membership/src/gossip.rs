@@ -87,8 +87,9 @@ pub fn build_gossip_message(
     table: &MembershipTable,
     sender_id: NodeId,
     sender_heartbeat: u32,
+    sender_incarnation: u32,
     fanout: usize,
 ) -> Message {
     let entries = table.gossip_wire_entries(fanout);
-    build_gossip(sender_id, sender_heartbeat, entries)
+    build_gossip(sender_id, sender_heartbeat, sender_incarnation, entries)
 }

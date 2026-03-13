@@ -72,8 +72,9 @@ pub async fn run_test_node(
                 if let Ok((msg, from)) = result {
                     // Clean up any bootstrap placeholder before inserting real entry.
                     node.table.remove_placeholder_for_addr(from, msg.sender_id);
-                    // Record sender liveness.
-                    let alive = NodeState::new_alive(msg.sender_id, from, msg.sender_heartbeat);
+                    // Record sender liveness (including incarnation from header).
+                    let mut alive = NodeState::new_alive(msg.sender_id, from, msg.sender_heartbeat);
+                    alive.incarnation = msg.sender_incarnation;
                     node.table.merge_entry(&alive);
                     node.failure_det.record_ack(msg.sender_id);
 
@@ -88,12 +89,12 @@ pub async fn run_test_node(
                                 node.table.merge_digest(&states);
                             }
                             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-                            let ack = build_ack(node.id, node.table.our_heartbeat(), piggyback);
+                            let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
                             let _ = node.transport.send_to(&ack, from).await;
                         }
                         MessagePayload::PingReq(req) => {
                             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-                            let ping = build_ping(node.id, node.table.our_heartbeat(), piggyback);
+                            let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
                             let _ = node.transport.send_to(&ping, SocketAddr::V4(req.target_addr)).await;
                         }
                         MessagePayload::Ack(entries) => {
@@ -113,7 +114,7 @@ pub async fn run_test_node(
             _ = gossip_tick.tick() => {
                 if let Some((_, peer_addr)) = gossip::pick_random_peer(&node.table, node.id) {
                     let msg = gossip::build_gossip_message(
-                        &node.table, node.id, node.table.our_heartbeat(), node.config.gossip_fanout,
+                        &node.table, node.id, node.table.our_heartbeat(), node.table.our_incarnation(), node.config.gossip_fanout,
                     );
                     let _ = node.transport.send_to(&msg, peer_addr).await;
                 }
@@ -129,7 +130,7 @@ pub async fn run_test_node(
                                 &node.table, node.id, id, node.config.indirect_probe_k,
                             );
                             for (_, inter_addr) in &intermediaries {
-                                let req = build_ping_req(node.id, node.table.our_heartbeat(), id, target_addr);
+                                let req = build_ping_req(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), id, target_addr);
                                 let _ = node.transport.send_to(&req, *inter_addr).await;
                             }
                             if !intermediaries.is_empty() {
@@ -153,7 +154,7 @@ pub async fn run_test_node(
                 if let Some((target_id, target_addr)) = gossip::pick_random_peer(&node.table, node.id) {
                     if !node.failure_det.is_probing(target_id) {
                         let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-                        let ping = build_ping(node.id, node.table.our_heartbeat(), piggyback);
+                        let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
                         if node.transport.send_to(&ping, target_addr).await.is_ok() {
                             node.failure_det.record_probe_sent(target_id);
                         }
@@ -321,10 +322,10 @@ async fn test_gossip_propagation_ring() {
     let _ = (id1, id2);
 }
 
-/// Dead merge rule: once a node is Dead in one table it should remain Dead
-/// even if a gossip with a higher-heartbeat Alive entry arrives.
+/// Dead merge rule: a Dead node cannot be resurrected at the same incarnation,
+/// but CAN rejoin at a higher incarnation (the node restarted).
 #[tokio::test]
-async fn test_dead_is_terminal_in_merge() {
+async fn test_dead_rejoin_with_incarnation() {
     use gossip_membership::membership::MembershipTable;
     use gossip_membership::node::{NodeState, NodeStatus};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -333,15 +334,25 @@ async fn test_dead_is_terminal_in_merge() {
     let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001);
     let mut table = MembershipTable::new(1, self_addr);
 
-    // Insert peer as Dead.
+    // Insert peer as Dead at incarnation 0.
     let mut dead = NodeState::new_alive(2, peer_addr, 10);
     dead.status = NodeStatus::Dead;
+    dead.incarnation = 0;
     table.merge_entry(&dead);
     assert_eq!(table.entries[&2].status, NodeStatus::Dead);
 
-    // Attempt resurrection with a higher heartbeat.
+    // Same incarnation, higher heartbeat — must NOT resurrect.
     table.merge_entry(&NodeState::new_alive(2, peer_addr, 20));
-    assert_eq!(table.entries[&2].status, NodeStatus::Dead, "Dead must be terminal");
+    assert_eq!(table.entries[&2].status, NodeStatus::Dead,
+        "same incarnation must not resurrect Dead");
+
+    // Higher incarnation — MUST resurrect (node restarted).
+    let mut rejoin = NodeState::new_alive(2, peer_addr, 0);
+    rejoin.incarnation = 1;
+    table.merge_entry(&rejoin);
+    assert_eq!(table.entries[&2].status, NodeStatus::Alive,
+        "higher incarnation must resurrect Dead node");
+    assert_eq!(table.entries[&2].incarnation, 1);
 }
 
 /// Heartbeat counter wraps around u32::MAX without panicking.
@@ -432,7 +443,7 @@ async fn test_gossip_message_encode_decode() {
         ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
         port: 8080,
     };
-    let msg = build_gossip(42, 3, vec![entry.clone()]);
+    let msg = build_gossip(42, 3, 0, vec![entry.clone()]);
     let buf = msg.encode().unwrap();
     let decoded = Message::decode(&buf).unwrap();
     assert_eq!(decoded.sender_id, 42);

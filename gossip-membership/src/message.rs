@@ -1,6 +1,6 @@
 /// Wire format for gossip messages.
 ///
-/// Fixed 18-byte header followed by a variable-length payload.
+/// Fixed 22-byte header followed by a variable-length payload.
 ///
 /// Header layout (big-endian):
 /// ```text
@@ -8,8 +8,9 @@
 ///  Bytes 1-2     : payload_len  (u16)  — number of bytes after the header
 ///  Bytes 3-10    : sender_id    (u64)  — originating node identity
 ///  Bytes 11-14   : heartbeat    (u32)  — sender's current heartbeat counter
-///  Byte  15      : flags        (u8)   — bit-0 = REQUEST_ACK
-///  Bytes 16-17   : checksum     (u16)  — RFC 1071 over entire buffer (zeroed for calc)
+///  Bytes 15-18   : incarnation  (u32)  — sender's current incarnation number
+///  Byte  19      : flags        (u8)   — bit-0 = REQUEST_ACK
+///  Bytes 20-21   : checksum     (u16)  — RFC 1071 over entire buffer (zeroed for calc)
 /// ```
 ///
 /// All multi-byte integers are big-endian (network byte order).
@@ -20,9 +21,10 @@ pub const OFF_KIND: usize = 0;
 pub const OFF_PLEN: usize = 1; // 2 bytes
 pub const OFF_SENDER_ID: usize = 3; // 8 bytes
 pub const OFF_HEARTBEAT: usize = 11; // 4 bytes
-pub const OFF_FLAGS: usize = 15;
-pub const OFF_CHECKSUM: usize = 16; // 2 bytes
-pub const HEADER_LEN: usize = 18;
+pub const OFF_INCARNATION: usize = 15; // 4 bytes
+pub const OFF_FLAGS: usize = 19;
+pub const OFF_CHECKSUM: usize = 20; // 2 bytes
+pub const HEADER_LEN: usize = 22;
 
 // ── Message kinds ────────────────────────────────────────────────────────────
 pub mod kind {
@@ -169,6 +171,7 @@ pub struct Message {
     pub kind: u8,
     pub sender_id: u64,
     pub sender_heartbeat: u32,
+    pub sender_incarnation: u32,
     pub flags: u8,
     pub payload: MessagePayload,
 }
@@ -245,6 +248,8 @@ impl Message {
         buf[OFF_SENDER_ID..OFF_SENDER_ID + 8].copy_from_slice(&self.sender_id.to_be_bytes());
         buf[OFF_HEARTBEAT..OFF_HEARTBEAT + 4]
             .copy_from_slice(&self.sender_heartbeat.to_be_bytes());
+        buf[OFF_INCARNATION..OFF_INCARNATION + 4]
+            .copy_from_slice(&self.sender_incarnation.to_be_bytes());
         buf[OFF_FLAGS] = self.flags;
         // Checksum field stays zero for computation.
         buf[HEADER_LEN..].copy_from_slice(&payload_bytes);
@@ -282,6 +287,8 @@ impl Message {
             u64::from_be_bytes(buf[OFF_SENDER_ID..OFF_SENDER_ID + 8].try_into().unwrap());
         let sender_heartbeat =
             u32::from_be_bytes(buf[OFF_HEARTBEAT..OFF_HEARTBEAT + 4].try_into().unwrap());
+        let sender_incarnation =
+            u32::from_be_bytes(buf[OFF_INCARNATION..OFF_INCARNATION + 4].try_into().unwrap());
         let flags = buf[OFF_FLAGS];
 
         let payload_buf = &buf[HEADER_LEN..];
@@ -311,6 +318,7 @@ impl Message {
             kind: msg_kind,
             sender_id,
             sender_heartbeat,
+            sender_incarnation,
             flags,
             payload,
         })
@@ -321,12 +329,14 @@ impl Message {
 pub fn build_gossip(
     sender_id: u64,
     sender_heartbeat: u32,
+    sender_incarnation: u32,
     entries: Vec<WireNodeEntry>,
 ) -> Message {
     Message {
         kind: kind::GOSSIP,
         sender_id,
         sender_heartbeat,
+        sender_incarnation,
         flags: 0,
         payload: MessagePayload::Gossip(entries),
     }
@@ -335,12 +345,14 @@ pub fn build_gossip(
 pub fn build_ping(
     sender_id: u64,
     sender_heartbeat: u32,
+    sender_incarnation: u32,
     entries: Vec<WireNodeEntry>,
 ) -> Message {
     Message {
         kind: kind::PING,
         sender_id,
         sender_heartbeat,
+        sender_incarnation,
         flags: 0,
         payload: MessagePayload::Ping(entries),
     }
@@ -349,6 +361,7 @@ pub fn build_ping(
 pub fn build_ping_req(
     sender_id: u64,
     sender_heartbeat: u32,
+    sender_incarnation: u32,
     target_id: u64,
     target_addr: SocketAddrV4,
 ) -> Message {
@@ -356,6 +369,7 @@ pub fn build_ping_req(
         kind: kind::PING_REQ,
         sender_id,
         sender_heartbeat,
+        sender_incarnation,
         flags: 0,
         payload: MessagePayload::PingReq(PingReqPayload {
             target_id,
@@ -367,12 +381,14 @@ pub fn build_ping_req(
 pub fn build_ack(
     sender_id: u64,
     sender_heartbeat: u32,
+    sender_incarnation: u32,
     entries: Vec<WireNodeEntry>,
 ) -> Message {
     Message {
         kind: kind::ACK,
         sender_id,
         sender_heartbeat,
+        sender_incarnation,
         flags: 0,
         payload: MessagePayload::Ack(entries),
     }
@@ -385,7 +401,7 @@ mod tests {
 
     #[test]
     fn roundtrip_gossip_empty() {
-        let msg = build_gossip(42, 7, vec![]);
+        let msg = build_gossip(42, 7, 0, vec![]);
         let buf = msg.encode().unwrap();
         let decoded = Message::decode(&buf).unwrap();
         assert_eq!(decoded.sender_id, 42);
@@ -403,7 +419,7 @@ mod tests {
             ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
             port: 8080,
         };
-        let msg = build_gossip(1, 2, vec![entry.clone()]);
+        let msg = build_gossip(1, 2, 0, vec![entry.clone()]);
         let buf = msg.encode().unwrap();
         let decoded = Message::decode(&buf).unwrap();
         match decoded.payload {
@@ -417,7 +433,7 @@ mod tests {
 
     #[test]
     fn roundtrip_ping() {
-        let msg = build_ping(1, 3, vec![]);
+        let msg = build_ping(1, 3, 0, vec![]);
         let buf = msg.encode().unwrap();
         let decoded = Message::decode(&buf).unwrap();
         assert!(matches!(decoded.payload, MessagePayload::Ping(ref e) if e.is_empty()));
@@ -434,7 +450,7 @@ mod tests {
             ip: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
             port: 7000,
         };
-        let msg = build_ping(1, 3, vec![entry.clone()]);
+        let msg = build_ping(1, 3, 0, vec![entry.clone()]);
         let buf = msg.encode().unwrap();
         let decoded = Message::decode(&buf).unwrap();
         match decoded.payload {
@@ -449,7 +465,7 @@ mod tests {
     #[test]
     fn roundtrip_ping_req() {
         let addr = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000);
-        let msg = build_ping_req(1, 2, 77, addr);
+        let msg = build_ping_req(1, 2, 0, 77, addr);
         let buf = msg.encode().unwrap();
         let decoded = Message::decode(&buf).unwrap();
         match decoded.payload {
@@ -463,7 +479,7 @@ mod tests {
 
     #[test]
     fn roundtrip_ack() {
-        let msg = build_ack(5, 10, vec![]);
+        let msg = build_ack(5, 10, 0, vec![]);
         let buf = msg.encode().unwrap();
         let decoded = Message::decode(&buf).unwrap();
         assert!(matches!(decoded.payload, MessagePayload::Ack(ref e) if e.is_empty()));
@@ -479,7 +495,7 @@ mod tests {
             ip: u32::from(Ipv4Addr::new(192, 168, 1, 1)),
             port: 5000,
         };
-        let msg = build_ack(5, 10, vec![entry.clone()]);
+        let msg = build_ack(5, 10, 0, vec![entry.clone()]);
         let buf = msg.encode().unwrap();
         let decoded = Message::decode(&buf).unwrap();
         match decoded.payload {
@@ -493,7 +509,7 @@ mod tests {
 
     #[test]
     fn checksum_catches_corruption() {
-        let msg = build_ping(1, 1, vec![]);
+        let msg = build_ping(1, 1, 0, vec![]);
         let mut buf = msg.encode().unwrap();
         // Flip a bit in the sender ID field.
         buf[OFF_SENDER_ID] ^= 0xFF;
@@ -509,7 +525,7 @@ mod tests {
 
     #[test]
     fn unknown_kind() {
-        let mut msg = build_ping(1, 1, vec![]);
+        let mut msg = build_ping(1, 1, 0, vec![]);
         msg.kind = 0xFF;
         let mut buf = msg.encode().unwrap();
         // Fix the checksum after changing kind in buf.
@@ -528,10 +544,10 @@ mod tests {
     #[test]
     fn checksum_valid_packet_accepted() {
         for msg in [
-            build_ping(1, 0, vec![]),
-            build_ping(u64::MAX, u32::MAX, vec![]),
-            build_ack(42, 100, vec![]),
-            build_gossip(7, 3, vec![WireNodeEntry {
+            build_ping(1, 0, 0, vec![]),
+            build_ping(u64::MAX, u32::MAX, 0, vec![]),
+            build_ack(42, 100, 0, vec![]),
+            build_gossip(7, 3, 0, vec![WireNodeEntry {
                 node_id: 1,
                 heartbeat: 0,
                 incarnation: 0,
@@ -551,7 +567,7 @@ mod tests {
     /// Every single-byte corruption must be detected.
     #[test]
     fn checksum_single_byte_corruption_rejected() {
-        let buf = build_ping(0xDEADBEEF_CAFEBABE, 42, vec![])
+        let buf = build_ping(0xDEADBEEF_CAFEBABE, 42, 0, vec![])
             .encode()
             .unwrap();
         // Flip each byte individually; every flip must cause a decode failure.
@@ -572,7 +588,7 @@ mod tests {
     /// A zero checksum on arbitrary data must be rejected.
     #[test]
     fn checksum_zero_stored_value_rejected_when_data_nonzero() {
-        let msg = build_ping(1, 1, vec![]);
+        let msg = build_ping(1, 1, 0, vec![]);
         let mut buf = msg.encode().unwrap();
         // Overwrite the stored checksum with 0x0000.
         buf[OFF_CHECKSUM] = 0x00;
@@ -588,7 +604,7 @@ mod tests {
     /// encode() must produce a non-trivial checksum and decode() must accept it.
     #[test]
     fn checksum_all_zero_fields_roundtrip() {
-        let msg = build_ping(0, 0, vec![]);
+        let msg = build_ping(0, 0, 0, vec![]);
         let buf = msg.encode().unwrap();
         // Checksum must be non-zero (kind byte = PING = 0x02, so data ≠ 0).
         let stored =
@@ -609,7 +625,7 @@ mod tests {
                 port: 9000 + i as u16,
             })
             .collect();
-        let msg = build_gossip(7, 42, entries.clone());
+        let msg = build_gossip(7, 42, 0, entries.clone());
         let buf = msg.encode().unwrap();
         assert_eq!(buf.len(), HEADER_LEN + 10 * NODE_ENTRY_LEN);
         let decoded = Message::decode(&buf).unwrap();

@@ -76,7 +76,8 @@ impl MembershipTable {
     ///    >= ours, we must refute by incrementing our incarnation and re-asserting
     ///    Alive (SWIM §4.2 — no heartbeat inflation).
     /// 2. Insert unknown entries unconditionally.
-    /// 3. Dead entries are terminal — never downgrade from Dead.
+    /// 3. Dead entries: a higher incarnation can resurrect a Dead node (rejoin).
+    ///    Same or lower incarnation cannot override Dead.
     /// 4. Higher incarnation always wins (wrapping-safe, RFC 1982 arithmetic).
     /// 5. Equal incarnation: higher heartbeat wins.
     /// 6. Equal incarnation + equal heartbeat: more severe status wins.
@@ -146,13 +147,16 @@ impl MembershipTable {
                 );
             }
             Some(existing) => {
-                // Rule 3: Dead is terminal.
-                if existing.status == NodeStatus::Dead {
+                // Rule 3: Dead can only be overridden by a higher incarnation
+                // (the node restarted and is rejoining the cluster).
+                if existing.status == NodeStatus::Dead
+                    && !is_newer(incoming.incarnation, existing.incarnation)
+                {
                     return;
                 }
 
                 let update = if is_newer(incoming.incarnation, existing.incarnation) {
-                    // Rule 4: higher incarnation always wins.
+                    // Rule 4: higher incarnation always wins (including Dead → Alive rejoin).
                     true
                 } else if incoming.incarnation == existing.incarnation {
                     if is_newer(incoming.heartbeat, existing.heartbeat) {
@@ -529,14 +533,55 @@ mod tests {
     }
 
     #[test]
-    fn dead_is_terminal() {
+    fn dead_blocks_same_incarnation() {
         let mut t = MembershipTable::new(1, make_addr(1000));
         let mut dead = NodeState::new_alive(2, make_addr(2000), 10);
         dead.status = NodeStatus::Dead;
         t.merge_entry(&dead);
-        // Alive with higher heartbeat must not resurrect.
+        // Alive with higher heartbeat but same incarnation must not resurrect.
         t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 20));
         assert_eq!(t.entries[&2].status, NodeStatus::Dead);
+    }
+
+    /// A Dead node can rejoin the cluster with a higher incarnation number.
+    #[test]
+    fn dead_node_rejoins_with_higher_incarnation() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        // Mark peer as Dead at incarnation 0.
+        let mut dead = NodeState::new_alive(2, make_addr(2000), 10);
+        dead.status = NodeStatus::Dead;
+        dead.incarnation = 0;
+        t.merge_entry(&dead);
+        assert_eq!(t.entries[&2].status, NodeStatus::Dead);
+
+        // Peer restarts and announces itself at incarnation 1.
+        let mut rejoin = NodeState::new_alive(2, make_addr(2000), 0);
+        rejoin.incarnation = 1;
+        t.merge_entry(&rejoin);
+
+        assert_eq!(t.entries[&2].status, NodeStatus::Alive, "higher incarnation must resurrect Dead");
+        assert_eq!(t.entries[&2].incarnation, 1);
+        assert_eq!(t.entries[&2].heartbeat, 0);
+    }
+
+    /// A Dead node cannot rejoin with a lower incarnation.
+    #[test]
+    fn dead_node_cannot_rejoin_with_lower_incarnation() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        let mut dead = NodeState::new_alive(2, make_addr(2000), 10);
+        dead.status = NodeStatus::Dead;
+        dead.incarnation = 3;
+        t.merge_entry(&dead);
+
+        // Stale rejoin at incarnation 1 — must be rejected.
+        let mut stale_rejoin = NodeState::new_alive(2, make_addr(2000), 0);
+        stale_rejoin.incarnation = 1;
+        t.merge_entry(&stale_rejoin);
+
+        assert_eq!(t.entries[&2].status, NodeStatus::Dead);
+        assert_eq!(t.entries[&2].incarnation, 3);
     }
 
     #[test]

@@ -122,6 +122,7 @@ pub async fn run_node(
                         &node.table,
                         node.id,
                         node.table.our_heartbeat(),
+                        node.table.our_incarnation(),
                         node.config.gossip_fanout,
                     );
                     match node.transport.send_to(&msg, peer_addr).await {
@@ -161,6 +162,7 @@ pub async fn run_node(
                             let req = build_ping_req(
                                 node.id,
                                 node.table.our_heartbeat(),
+                                node.table.our_incarnation(),
                                 target_id,
                                 target_addr,
                             );
@@ -200,7 +202,7 @@ pub async fn run_node(
                 {
                     if !node.failure_det.is_probing(target_id) {
                         let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-                        let ping = build_ping(node.id, node.table.our_heartbeat(), piggyback);
+                        let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
                         match node.transport.send_to(&ping, target_addr).await {
                             Ok(()) => {
                                 node.failure_det.record_probe_sent(target_id);
@@ -234,11 +236,12 @@ async fn handle_message(
     node.table.remove_placeholder_for_addr(from_addr, msg.sender_id);
 
     // Any message from a node proves it is alive — record liveness from header.
-    let sender_alive = gossip_membership::node::NodeState::new_alive(
+    let mut sender_alive = gossip_membership::node::NodeState::new_alive(
         msg.sender_id,
         from_addr,
         msg.sender_heartbeat,
     );
+    sender_alive.incarnation = msg.sender_incarnation;
     node.table.merge_entry(&sender_alive);
 
     // If we had an in-flight probe for this sender, an incoming message resolves it.
@@ -264,7 +267,7 @@ async fn handle_message(
             }
             // Respond immediately with an ACK so the sender clears its probe.
             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-            let ack = build_ack(node.id, node.table.our_heartbeat(), piggyback);
+            let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
             if let Err(e) = node.transport.send_to(&ack, from_addr).await {
                 log::warn!("[node {}] ACK send failed to {from_addr}: {e}", node.id);
             } else {
@@ -278,7 +281,7 @@ async fn handle_message(
             // own timeout and will receive the ACK directly if the target is alive.
             let target_addr = SocketAddr::V4(req.target_addr);
             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-            let ping = build_ping(node.id, node.table.our_heartbeat(), piggyback);
+            let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
             if let Err(e) = node.transport.send_to(&ping, target_addr).await {
                 log::warn!(
                     "[node {}] indirect PING to {} failed: {e}",
