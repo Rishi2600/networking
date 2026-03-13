@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crate::message::{status, WireNodeEntry};
+use crate::metrics::MergeOutcome;
 use crate::node::{NodeId, NodeState, NodeStatus};
 
 // ── Table ─────────────────────────────────────────────────────────────────────
@@ -82,7 +83,7 @@ impl MembershipTable {
     /// 5. Equal incarnation: higher heartbeat wins.
     /// 6. Equal incarnation + equal heartbeat: more severe status wins.
     /// 7. Otherwise discard — existing entry is equally or more current.
-    pub fn merge_entry(&mut self, incoming: &NodeState) {
+    pub fn merge_entry(&mut self, incoming: &NodeState) -> MergeOutcome {
         // Discard stale placeholder views of our own address.  When a peer
         // bootstraps it creates a synthetic placeholder entry for us (with a
         // derived node_id) and may gossip it before learning our real id.
@@ -91,7 +92,7 @@ impl MembershipTable {
         // We are always the authority on our own address, so any entry that
         // carries local_addr but a different node_id must be discarded.
         if incoming.addr == self.local_addr && incoming.node_id != self.local_id {
-            return;
+            return MergeOutcome::SelfEntry;
         }
 
         // Rule 1: never let remote nodes overwrite our own entry.
@@ -119,7 +120,7 @@ impl MembershipTable {
                 e.status = NodeStatus::Alive;
                 e.last_update = Instant::now();
             }
-            return;
+            return MergeOutcome::SelfEntry;
         }
 
         let now = Instant::now();
@@ -145,6 +146,7 @@ impl MembershipTable {
                     incoming.incarnation,
                     incoming.status
                 );
+                MergeOutcome::New
             }
             Some(existing) => {
                 // Rule 3: Dead can only be overridden by a higher incarnation
@@ -152,7 +154,7 @@ impl MembershipTable {
                 if existing.status == NodeStatus::Dead
                     && !is_newer(incoming.incarnation, existing.incarnation)
                 {
-                    return;
+                    return MergeOutcome::Stale;
                 }
 
                 let update = if is_newer(incoming.incarnation, existing.incarnation) {
@@ -201,16 +203,18 @@ impl MembershipTable {
                     } else if incoming.status != NodeStatus::Suspect {
                         entry.suspect_since = None;
                     }
+                    MergeOutcome::Updated
+                } else {
+                    MergeOutcome::Stale
                 }
             }
         }
     }
 
     /// Merge a full gossip digest (slice of node states).
-    pub fn merge_digest(&mut self, entries: &[NodeState]) {
-        for e in entries {
-            self.merge_entry(e);
-        }
+    /// Returns the outcomes for each entry so the caller can update metrics.
+    pub fn merge_digest(&mut self, entries: &[NodeState]) -> Vec<MergeOutcome> {
+        entries.iter().map(|e| self.merge_entry(e)).collect()
     }
 
     // ── Status transitions ────────────────────────────────────────────────────
@@ -237,6 +241,21 @@ impl MembershipTable {
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
+    /// Count entries by status: `(alive, suspect, dead)`.
+    pub fn status_counts(&self) -> (usize, usize, usize) {
+        let mut alive = 0usize;
+        let mut suspect = 0usize;
+        let mut dead = 0usize;
+        for e in self.entries.values() {
+            match e.status {
+                NodeStatus::Alive => alive += 1,
+                NodeStatus::Suspect => suspect += 1,
+                NodeStatus::Dead => dead += 1,
+            }
+        }
+        (alive, suspect, dead)
+    }
+
     /// Return IDs of all nodes currently Alive or Suspect, excluding ourselves.
     pub fn live_nodes(&self) -> Vec<NodeId> {
         self.entries

@@ -12,6 +12,7 @@ use tokio::sync::oneshot;
 
 use gossip_membership::crypto::ClusterKey;
 use gossip_membership::membership::MembershipTable;
+use gossip_membership::metrics::Metrics;
 use gossip_membership::node::{NodeConfig, NodeStatus};
 use gossip_membership::transport::Transport;
 
@@ -37,6 +38,7 @@ pub struct TestNode {
     transport: Transport,
     pub table: MembershipTable,
     failure_det: FailureDetector,
+    pub metrics: Metrics,
 }
 
 impl TestNode {
@@ -47,7 +49,7 @@ impl TestNode {
             table.add_bootstrap_peer(p);
         }
         let failure_det = FailureDetector::new(Duration::from_millis(config.probe_timeout_ms));
-        Self { id, config, transport, table, failure_det }
+        Self { id, config, transport, table, failure_det, metrics: Metrics::default() }
     }
 }
 
@@ -76,32 +78,47 @@ pub async fn run_test_node(
                     // Record sender liveness (including incarnation from header).
                     let mut alive = NodeState::new_alive(msg.sender_id, from, msg.sender_heartbeat);
                     alive.incarnation = msg.sender_incarnation;
-                    node.table.merge_entry(&alive);
+                    let outcome = node.table.merge_entry(&alive);
+                    node.metrics.record_merge(outcome);
                     node.failure_det.record_ack(msg.sender_id);
 
                     match &msg.payload {
                         MessagePayload::Gossip(entries) => {
+                            node.metrics.gossip_recv += 1;
                             let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
-                            node.table.merge_digest(&states);
+                            for o in node.table.merge_digest(&states) {
+                                node.metrics.record_merge(o);
+                            }
                         }
                         MessagePayload::Ping(entries) => {
+                            node.metrics.pings_recv += 1;
                             if !entries.is_empty() {
                                 let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
-                                node.table.merge_digest(&states);
+                                for o in node.table.merge_digest(&states) {
+                                    node.metrics.record_merge(o);
+                                }
                             }
                             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
                             let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
-                            let _ = node.transport.send_to(&ack, from).await;
+                            if node.transport.send_to(&ack, from).await.is_ok() {
+                                node.metrics.acks_sent += 1;
+                            }
                         }
                         MessagePayload::PingReq(req) => {
+                            node.metrics.ping_reqs_recv += 1;
                             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
                             let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
-                            let _ = node.transport.send_to(&ping, req.target_addr).await;
+                            if node.transport.send_to(&ping, req.target_addr).await.is_ok() {
+                                node.metrics.pings_sent += 1;
+                            }
                         }
                         MessagePayload::Ack(entries) => {
+                            node.metrics.acks_recv += 1;
                             if !entries.is_empty() {
                                 let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
-                                node.table.merge_digest(&states);
+                                for o in node.table.merge_digest(&states) {
+                                    node.metrics.record_merge(o);
+                                }
                             }
                         }
                     }
@@ -117,6 +134,7 @@ pub async fn run_test_node(
                     &node.table, node.id, node.config.max_gossip_sends,
                 );
                 if !targets.is_empty() {
+                    node.metrics.gossip_rounds += 1;
                     let fanout = gossip::effective_fanout(
                         node.config.gossip_fanout,
                         node.table.entries.len(),
@@ -126,7 +144,9 @@ pub async fn run_test_node(
                         &node.table, node.id, node.table.our_heartbeat(), node.table.our_incarnation(), fanout,
                     );
                     for (_, peer_addr) in &targets {
-                        let _ = node.transport.send_to(&msg, *peer_addr).await;
+                        if node.transport.send_to(&msg, *peer_addr).await.is_ok() {
+                            node.metrics.gossip_sent += 1;
+                        }
                     }
                 }
             }
@@ -134,6 +154,7 @@ pub async fn run_test_node(
             _ = probe_tick.tick() => {
                 use std::time::Instant;
                 let scan = node.failure_det.scan(Instant::now());
+                node.metrics.probe_direct_timeouts += scan.escalate_to_indirect.len() as u64;
                 for id in scan.escalate_to_indirect {
                     if let Some(target_state) = node.table.entries.get(&id) {
                         let target_addr = target_state.addr;
@@ -142,13 +163,16 @@ pub async fn run_test_node(
                         );
                         for (_, inter_addr) in &intermediaries {
                             let req = build_ping_req(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), id, target_addr);
-                            let _ = node.transport.send_to(&req, *inter_addr).await;
+                            if node.transport.send_to(&req, *inter_addr).await.is_ok() {
+                                node.metrics.ping_reqs_sent += 1;
+                            }
                         }
                         if !intermediaries.is_empty() {
                             node.failure_det.record_indirect_probe_sent(id);
                         }
                     }
                 }
+                node.metrics.probe_failures += scan.declare_suspect.len() as u64;
                 for id in scan.declare_suspect {
                     node.table.suspect(id);
                 }
@@ -166,6 +190,7 @@ pub async fn run_test_node(
                         let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
                         let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
                         if node.transport.send_to(&ping, target_addr).await.is_ok() {
+                            node.metrics.pings_sent += 1;
                             node.failure_det.record_probe_sent(target_id);
                         }
                     }
@@ -1011,8 +1036,59 @@ async fn test_multi_target_gossip_converges() {
             }
             assert!(
                 node.table.entries.values().any(|e| e.node_id == expected_id),
-                "node[{i}] does not know about node[{j}] (id={expected_id})"
+                "multi-target: node[{i}] does not know about node[{j}] (id={expected_id})"
             );
         }
     }
+}
+
+// ── Metrics tests ────────────────────────────────────────────────────────────
+
+/// After two nodes gossip for a while, both should have non-zero metrics
+/// for gossip rounds, sends, receives, pings, acks, and merges.
+#[tokio::test]
+async fn test_metrics_collected_after_convergence() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
+    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_test_node(n1, rx1));
+    let h2 = tokio::spawn(run_test_node(n2, rx2));
+
+    // Let nodes gossip and probe for a while.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+
+    // Both nodes should have sent and received gossip.
+    for (name, m) in [("node1", &node1.metrics), ("node2", &node2.metrics)] {
+        assert!(m.gossip_rounds > 0, "{name}: gossip_rounds should be > 0");
+        assert!(m.gossip_sent > 0, "{name}: gossip_sent should be > 0");
+        assert!(m.gossip_recv > 0, "{name}: gossip_recv should be > 0");
+        assert!(m.pings_sent > 0, "{name}: pings_sent should be > 0");
+        assert!(m.pings_recv > 0, "{name}: pings_recv should be > 0");
+        assert!(m.acks_sent > 0, "{name}: acks_sent should be > 0");
+        assert!(m.acks_recv > 0, "{name}: acks_recv should be > 0");
+        assert!(m.merges_new > 0, "{name}: merges_new should be > 0 (discovered peer)");
+    }
+
+    // Verify summary formatting works.
+    let (alive, suspect, dead) = node1.table.status_counts();
+    let summary = node1.metrics.summary(alive, suspect, dead);
+    assert!(summary.contains("gossip_rounds="));
+    assert!(summary.contains("alive="));
 }

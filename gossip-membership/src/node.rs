@@ -121,6 +121,8 @@ pub struct NodeConfig {
     pub dead_retention_ms: u64,
     /// Max membership entries to piggyback on PING/ACK messages.
     pub piggyback_max: usize,
+    /// How often to log a metrics summary (ms).  0 = disabled.
+    pub metrics_log_interval_ms: u64,
 }
 
 impl Default for NodeConfig {
@@ -139,6 +141,7 @@ impl Default for NodeConfig {
             max_gossip_sends: 1,
             dead_retention_ms: 15_000,
             piggyback_max: 6,
+            metrics_log_interval_ms: 10_000,
         }
     }
 }
@@ -160,6 +163,7 @@ impl NodeConfig {
             max_gossip_sends: 1,
             dead_retention_ms: 1_000,
             piggyback_max: 6,
+            metrics_log_interval_ms: 0, // disabled in tests
         }
     }
 }

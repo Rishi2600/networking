@@ -23,6 +23,7 @@ use gossip_membership::membership::{wire_to_node_state, MembershipTable};
 use gossip_membership::message::{
     build_ack, build_ping, build_ping_req, MessagePayload,
 };
+use gossip_membership::metrics::Metrics;
 use gossip_membership::node::{generate_node_id, NodeConfig, NodeId};
 use gossip_membership::transport::Transport;
 
@@ -55,6 +56,7 @@ pub struct Node {
     transport: Transport,
     table: MembershipTable,
     failure_det: FailureDetector,
+    pub metrics: Metrics,
 }
 
 impl Node {
@@ -77,6 +79,7 @@ impl Node {
             transport,
             table,
             failure_det,
+            metrics: Metrics::default(),
         }
     }
 }
@@ -95,10 +98,19 @@ pub async fn run_node(
     let mut probe_tick =
         tokio::time::interval(Duration::from_millis(node.config.probe_interval_ms));
 
+    // Metrics logging timer (disabled when interval == 0).
+    let metrics_ms = node.config.metrics_log_interval_ms;
+    let mut metrics_tick = tokio::time::interval(if metrics_ms > 0 {
+        Duration::from_millis(metrics_ms)
+    } else {
+        Duration::from_secs(3600) // effectively disabled
+    });
+
     // Don't burst on startup — skip missed ticks rather than compressing them.
     gossip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -134,6 +146,7 @@ pub async fn run_node(
                     node.config.max_gossip_sends,
                 );
                 if !targets.is_empty() {
+                    node.metrics.gossip_rounds += 1;
                     let fanout = gossip::effective_fanout(
                         node.config.gossip_fanout,
                         node.table.entries.len(),
@@ -148,10 +161,13 @@ pub async fn run_node(
                     );
                     for (peer_id, peer_addr) in &targets {
                         match node.transport.send_to(&msg, *peer_addr).await {
-                            Ok(()) => log::debug!(
-                                "[node {}] gossip → peer {} @ {}",
-                                node.id, peer_id, peer_addr
-                            ),
+                            Ok(()) => {
+                                node.metrics.gossip_sent += 1;
+                                log::debug!(
+                                    "[node {}] gossip → peer {} @ {}",
+                                    node.id, peer_id, peer_addr
+                                );
+                            }
                             Err(e) => log::warn!(
                                 "[node {}] gossip send failed to {peer_addr}: {e}",
                                 node.id
@@ -167,6 +183,8 @@ pub async fn run_node(
 
                 // Step 1: check pending probes for timeouts.
                 let scan = node.failure_det.scan(now);
+
+                node.metrics.probe_direct_timeouts += scan.escalate_to_indirect.len() as u64;
 
                 for target_id in scan.escalate_to_indirect {
                     // Direct probe timed out; send PING_REQ to k intermediaries.
@@ -186,7 +204,9 @@ pub async fn run_node(
                                 target_id,
                                 target_addr,
                             );
-                            let _ = node.transport.send_to(&req, *inter_addr).await;
+                            if node.transport.send_to(&req, *inter_addr).await.is_ok() {
+                                node.metrics.ping_reqs_sent += 1;
+                            }
                         }
                         if !intermediaries.is_empty() {
                             node.failure_det.record_indirect_probe_sent(target_id);
@@ -199,6 +219,7 @@ pub async fn run_node(
                     }
                 }
 
+                node.metrics.probe_failures += scan.declare_suspect.len() as u64;
                 for id in scan.declare_suspect {
                     node.table.suspect(id);
                 }
@@ -225,6 +246,7 @@ pub async fn run_node(
                         let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
                         match node.transport.send_to(&ping, target_addr).await {
                             Ok(()) => {
+                                node.metrics.pings_sent += 1;
                                 node.failure_det.record_probe_sent(target_id);
                                 log::debug!(
                                     "[node {}] PING → {} @ {}",
@@ -238,6 +260,15 @@ pub async fn run_node(
                         }
                     }
                 }
+            }
+
+            // ── Branch 5: periodic metrics log ───────────────────────────────
+            _ = metrics_tick.tick(), if metrics_ms > 0 => {
+                let (alive, suspect, dead) = node.table.status_counts();
+                log::info!(
+                    "[metrics] {}",
+                    node.metrics.summary(alive, suspect, dead)
+                );
             }
         }
     }
@@ -262,13 +293,15 @@ async fn handle_message(
         msg.sender_heartbeat,
     );
     sender_alive.incarnation = msg.sender_incarnation;
-    node.table.merge_entry(&sender_alive);
+    let outcome = node.table.merge_entry(&sender_alive);
+    node.metrics.record_merge(outcome);
 
     // If we had an in-flight probe for this sender, an incoming message resolves it.
     node.failure_det.record_ack(msg.sender_id);
 
     match &msg.payload {
         MessagePayload::Gossip(entries) => {
+            node.metrics.gossip_recv += 1;
             let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
             log::debug!(
                 "[node {}] gossip from {} ({} entries)",
@@ -276,14 +309,19 @@ async fn handle_message(
                 msg.sender_id,
                 states.len()
             );
-            node.table.merge_digest(&states);
+            for o in node.table.merge_digest(&states) {
+                node.metrics.record_merge(o);
+            }
         }
 
         MessagePayload::Ping(ref entries) => {
+            node.metrics.pings_recv += 1;
             // Merge piggybacked membership entries.
             if !entries.is_empty() {
                 let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
-                node.table.merge_digest(&states);
+                for o in node.table.merge_digest(&states) {
+                    node.metrics.record_merge(o);
+                }
             }
             // Respond immediately with an ACK so the sender clears its probe.
             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
@@ -291,14 +329,14 @@ async fn handle_message(
             if let Err(e) = node.transport.send_to(&ack, from_addr).await {
                 log::warn!("[node {}] ACK send failed to {from_addr}: {e}", node.id);
             } else {
+                node.metrics.acks_sent += 1;
                 log::trace!("[node {}] ACK → {} @ {}", node.id, msg.sender_id, from_addr);
             }
         }
 
         MessagePayload::PingReq(req) => {
+            node.metrics.ping_reqs_recv += 1;
             // Forward a PING to the target on behalf of the requester.
-            // We do not wait for or forward the ACK — the requester has its
-            // own timeout and will receive the ACK directly if the target is alive.
             let target_addr = req.target_addr;
             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
             let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
@@ -308,6 +346,7 @@ async fn handle_message(
                     node.id, target_addr
                 );
             } else {
+                node.metrics.pings_sent += 1;
                 log::debug!(
                     "[node {}] forwarded PING → {} (for requester {})",
                     node.id,
@@ -318,10 +357,13 @@ async fn handle_message(
         }
 
         MessagePayload::Ack(ref entries) => {
+            node.metrics.acks_recv += 1;
             // Merge piggybacked membership entries.
             if !entries.is_empty() {
                 let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
-                node.table.merge_digest(&states);
+                for o in node.table.merge_digest(&states) {
+                    node.metrics.record_merge(o);
+                }
             }
             log::trace!(
                 "[node {}] ACK from {} @ {} ({} piggybacked)",

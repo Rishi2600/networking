@@ -3,5 +3,6 @@ pub mod failure_detector;
 pub mod gossip;
 pub mod membership;
 pub mod message;
+pub mod metrics;
 pub mod node;
 pub mod transport;
