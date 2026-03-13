@@ -589,6 +589,100 @@ async fn test_placeholder_cleaned_up_on_first_message() {
     );
 }
 
+/// When Node A has a placeholder for Node C and gossips to Node B, the
+/// placeholder must NOT appear in A's gossip digest — only real entries
+/// propagate.  Once A learns C's real id (via gossip from B or C), the
+/// placeholder is evicted.
+#[tokio::test]
+async fn test_placeholder_not_propagated_via_gossip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    // Three nodes: A knows B only, B knows C only, C knows nobody.
+    // A also bootstraps with C's address (creating a placeholder for C).
+    let ta = bind_local().await;
+    let tb = bind_local().await;
+    let tc = bind_local().await;
+    let addr_a = ta.local_addr;
+    let addr_b = tb.local_addr;
+    let addr_c = tc.local_addr;
+
+    let na = TestNode::new(ta, cfg.clone(), &[addr_b, addr_c]);
+    let nb = TestNode::new(tb, cfg.clone(), &[addr_a]);
+    let nc = TestNode::new(tc, cfg.clone(), &[addr_b]);
+    let id_a = na.id;
+    let id_b = nb.id;
+    let id_c = nc.id;
+
+    // A has a placeholder for C before any gossip.
+    let placeholder_c = placeholder_id_for(addr_c);
+    assert!(
+        na.table.is_placeholder(placeholder_c),
+        "A must have a placeholder for C's address before gossip"
+    );
+
+    let (txa, rxa) = oneshot::channel::<()>();
+    let (txb, rxb) = oneshot::channel::<()>();
+    let (txc, rxc) = oneshot::channel::<()>();
+
+    let ha = tokio::spawn(run_test_node(na, rxa));
+    let hb = tokio::spawn(run_test_node(nb, rxb));
+    let hc = tokio::spawn(run_test_node(nc, rxc));
+
+    // Allow convergence.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let _ = txa.send(());
+    let _ = txb.send(());
+    let _ = txc.send(());
+
+    let node_a = ha.await.unwrap();
+    let node_b = hb.await.unwrap();
+    let node_c = hc.await.unwrap();
+
+    // A's placeholder for C must be gone — replaced by C's real entry.
+    assert!(
+        !node_a.table.is_placeholder(placeholder_c),
+        "A's placeholder for C must be evicted after convergence"
+    );
+    assert!(
+        node_a.table.entries.values().any(|e| e.node_id == id_c),
+        "A must know C's real id after convergence"
+    );
+
+    // B must NOT have the placeholder — A should never have gossiped it.
+    assert!(
+        !node_b.table.entries.contains_key(&placeholder_c),
+        "B must not have received A's placeholder for C via gossip"
+    );
+
+    // No duplicate addresses in any table.
+    for (name, node) in [("A", &node_a), ("B", &node_b), ("C", &node_c)] {
+        let mut seen = std::collections::HashSet::new();
+        for entry in node.table.entries.values() {
+            assert!(
+                seen.insert(entry.addr),
+                "{name}: address {} appears more than once",
+                entry.addr
+            );
+        }
+    }
+
+    // Full convergence: everyone knows everyone.
+    for (name, node, expected) in [
+        ("A", &node_a, vec![id_b, id_c]),
+        ("B", &node_b, vec![id_a, id_c]),
+        ("C", &node_c, vec![id_a, id_b]),
+    ] {
+        for eid in expected {
+            assert!(
+                node.table.entries.values().any(|e| e.node_id == eid),
+                "{name} does not know about node {eid}"
+            );
+        }
+    }
+}
+
 /// After bootstrap and a few gossip rounds, each peer address appears exactly
 /// once in each node's membership table (no duplicate entries).
 #[tokio::test]

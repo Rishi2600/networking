@@ -1,6 +1,6 @@
 /// Membership table: stores the cluster-wide view of node state and implements
 /// the gossip merge rules.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,10 @@ pub struct MembershipTable {
     /// Our own incarnation number. Incremented whenever we learn we have been
     /// suspected, allowing us to refute without inflating our heartbeat counter.
     local_incarnation: u32,
+    /// Node IDs that are bootstrap placeholders (synthetic, pre-real-id).
+    /// Tracked so we can (a) filter them from gossip output and (b) evict them
+    /// when a real entry for the same address arrives.
+    placeholder_ids: HashSet<NodeId>,
 }
 
 impl MembershipTable {
@@ -26,6 +30,7 @@ impl MembershipTable {
             local_addr,
             local_heartbeat: 0,
             local_incarnation: 0,
+            placeholder_ids: HashSet::new(),
         };
         // Seed our own entry as Alive with heartbeat 0, incarnation 0.
         t.entries.insert(
@@ -120,6 +125,10 @@ impl MembershipTable {
         match existing {
             // Rule 2: new node.
             None => {
+                // If we hold a placeholder for this address, evict it now —
+                // the incoming entry carries the real node_id.
+                self.evict_placeholder_at(incoming.addr);
+
                 self.entries.insert(incoming.node_id, {
                     let mut s = incoming.clone();
                     s.last_update = now;
@@ -265,12 +274,24 @@ impl MembershipTable {
 
     /// Return up to `max_entries` entries for gossiping, prioritising recently
     /// updated entries so fresh information spreads faster (infection-style).
+    ///
+    /// Placeholder entries (bootstrap peers whose real IDs we haven't learned
+    /// yet) are excluded — they are local bookkeeping and must not propagate.
     pub fn gossip_digest(&self, max_entries: usize) -> Vec<NodeState> {
-        let mut all: Vec<&NodeState> = self.entries.values().collect();
+        let mut all: Vec<&NodeState> = self
+            .entries
+            .values()
+            .filter(|e| !self.placeholder_ids.contains(&e.node_id))
+            .collect();
         // Most recently updated first.
         all.sort_by(|a, b| b.last_update.cmp(&a.last_update));
         all.truncate(max_entries);
         all.into_iter().cloned().collect()
+    }
+
+    /// Returns `true` if `id` is a bootstrap placeholder (synthetic node ID).
+    pub fn is_placeholder(&self, id: NodeId) -> bool {
+        self.placeholder_ids.contains(&id)
     }
 
     /// Convert a gossip digest into wire entries.
@@ -286,10 +307,14 @@ impl MembershipTable {
         // We don't know the peer's node_id yet; derive a placeholder key from
         // the address. The real entry will be corrected by the first gossip round.
         let placeholder_id = placeholder_id_for(addr);
-        self.entries.entry(placeholder_id).or_insert_with(|| {
+        if !self.entries.contains_key(&placeholder_id) {
             log::debug!("[membership] bootstrap peer {} (placeholder id={})", addr, placeholder_id);
-            NodeState::new_alive(placeholder_id, addr, 0)
-        });
+            self.entries.insert(
+                placeholder_id,
+                NodeState::new_alive(placeholder_id, addr, 0),
+            );
+            self.placeholder_ids.insert(placeholder_id);
+        }
     }
 
     /// Remove the placeholder entry for `addr` if the real sender's `id` differs.
@@ -308,10 +333,30 @@ impl MembershipTable {
         }
         if self.entries.get(&placeholder_id).map(|e| e.addr == addr).unwrap_or(false) {
             self.entries.remove(&placeholder_id);
+            self.placeholder_ids.remove(&placeholder_id);
             log::debug!(
                 "[membership] removed placeholder {} for {} (real id={})",
                 placeholder_id, addr, real_id
             );
+        }
+    }
+
+    /// Evict a placeholder whose address matches `addr`.
+    ///
+    /// Called from `merge_entry` when inserting a real node entry. This handles
+    /// the case where we learn a node's real ID through gossip (not a direct
+    /// message), so `remove_placeholder_for_addr` was never called for it.
+    fn evict_placeholder_at(&mut self, addr: SocketAddr) {
+        let placeholder_id = placeholder_id_for(addr);
+        if self.placeholder_ids.contains(&placeholder_id) {
+            if self.entries.get(&placeholder_id).map(|e| e.addr == addr).unwrap_or(false) {
+                self.entries.remove(&placeholder_id);
+                self.placeholder_ids.remove(&placeholder_id);
+                log::debug!(
+                    "[membership] evicted placeholder {} for addr {} (real entry arriving via gossip)",
+                    placeholder_id, addr
+                );
+            }
         }
     }
 }
@@ -716,5 +761,85 @@ mod tests {
         let back = wire_to_node_state(&wire).expect("valid wire entry");
         assert_eq!(back.incarnation, 3);
         assert_eq!(back.status, NodeStatus::Suspect);
+    }
+
+    // ── Placeholder tests ─────────────────────────────────────────────────────
+
+    /// Bootstrap placeholders must be tracked and queryable.
+    #[test]
+    fn placeholder_tracked_on_add() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.add_bootstrap_peer(make_addr(2000));
+        let pid = placeholder_id_for(make_addr(2000));
+        assert!(t.is_placeholder(pid));
+        assert!(t.entries.contains_key(&pid));
+    }
+
+    /// Placeholder entries must never appear in gossip_digest.
+    #[test]
+    fn placeholder_excluded_from_gossip_digest() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.add_bootstrap_peer(make_addr(2000));
+        let pid = placeholder_id_for(make_addr(2000));
+
+        // Table has self + placeholder = 2 entries.
+        assert_eq!(t.entries.len(), 2);
+
+        // Digest must only contain self — placeholder is filtered.
+        let digest = t.gossip_digest(50);
+        assert_eq!(digest.len(), 1, "placeholder must not appear in gossip digest");
+        assert_eq!(digest[0].node_id, 1);
+        assert!(!digest.iter().any(|e| e.node_id == pid));
+    }
+
+    /// remove_placeholder_for_addr clears placeholder from both entries and
+    /// the tracking set.
+    #[test]
+    fn remove_placeholder_clears_tracking() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.add_bootstrap_peer(make_addr(2000));
+        let pid = placeholder_id_for(make_addr(2000));
+        assert!(t.is_placeholder(pid));
+
+        // Simulate learning the real id for addr 2000.
+        t.remove_placeholder_for_addr(make_addr(2000), 42);
+        assert!(!t.is_placeholder(pid));
+        assert!(!t.entries.contains_key(&pid));
+    }
+
+    /// When a gossip entry carries a real node_id for an address we only know
+    /// via a placeholder, merge_entry must evict the placeholder.
+    #[test]
+    fn gossip_entry_evicts_placeholder() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.add_bootstrap_peer(make_addr(3000));
+        let pid = placeholder_id_for(make_addr(3000));
+        assert!(t.entries.contains_key(&pid));
+
+        // A gossip tells us the real node at addr 3000 has id=99.
+        let real = NodeState::new_alive(99, make_addr(3000), 5);
+        t.merge_entry(&real);
+
+        // Placeholder must be gone; real entry must exist.
+        assert!(!t.entries.contains_key(&pid), "placeholder must be evicted");
+        assert!(!t.is_placeholder(pid));
+        assert_eq!(t.entries[&99].heartbeat, 5);
+    }
+
+    /// Placeholder for our own address is discarded by the local_addr guard
+    /// in merge_entry (no duplicate address entries).
+    #[test]
+    fn placeholder_for_own_addr_discarded() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        // Simulate receiving a gossip entry that has our address but a
+        // different (placeholder-style) node_id.
+        let stale = NodeState::new_alive(0xDEAD, make_addr(1000), 0);
+        t.merge_entry(&stale);
+
+        // Only our own entry should exist for addr 1000.
+        let count = t.entries.values().filter(|e| e.addr == make_addr(1000)).count();
+        assert_eq!(count, 1, "only one entry for our own address");
+        assert_eq!(t.entries[&1].addr, make_addr(1000));
     }
 }
