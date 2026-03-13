@@ -1,18 +1,22 @@
 /// Gossip-based distributed membership protocol — node runner and CLI.
 ///
 /// Usage:
-///   # Start a standalone bootstrap node:
-///   cargo run -- --bind 127.0.0.1:7000
+///   # Generate a cluster key:
+///   cargo run -- --generate-key
+///
+///   # Start a standalone bootstrap node (encrypted):
+///   cargo run -- --bind 127.0.0.1:7000 --cluster-key <HEX>
 ///
 ///   # Join an existing cluster:
-///   cargo run -- --bind 127.0.0.1:7001 --peers 127.0.0.1:7000
-///   cargo run -- --bind 127.0.0.1:7002 --peers 127.0.0.1:7000,127.0.0.1:7001
+///   cargo run -- --bind 127.0.0.1:7001 --peers 127.0.0.1:7000 --cluster-key <HEX>
+///   cargo run -- --bind 127.0.0.1:7002 --peers 127.0.0.1:7000,127.0.0.1:7001 --cluster-key <HEX>
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tokio::sync::oneshot;
 
+use gossip_membership::crypto::{self, ClusterKey};
 use gossip_membership::failure_detector::FailureDetector;
 use gossip_membership::gossip;
 use gossip_membership::membership::{wire_to_node_state, MembershipTable};
@@ -33,6 +37,15 @@ struct Args {
     /// Comma-separated list of bootstrap peer addresses (e.g. 127.0.0.1:7000)
     #[arg(long, value_delimiter = ',', default_value = "")]
     peers: Vec<String>,
+
+    /// Shared cluster key (64 hex chars = 256-bit ChaCha20-Poly1305 key).
+    /// All nodes in the cluster must use the same key.
+    #[arg(long)]
+    cluster_key: Option<String>,
+
+    /// Generate a random cluster key, print it, and exit.
+    #[arg(long)]
+    generate_key: bool,
 }
 
 // ── Node ───────────────────────────────────────────────────────────────────────
@@ -318,6 +331,23 @@ async fn main() {
 
     let args = Args::parse();
 
+    // --generate-key: print a random key and exit.
+    if args.generate_key {
+        let key_bytes = crypto::generate_key();
+        println!("{}", crypto::key_to_hex(&key_bytes));
+        return;
+    }
+
+    // Parse optional cluster key.
+    let cluster_key: Option<ClusterKey> = args.cluster_key.as_deref().map(|hex| {
+        let bytes = crypto::key_from_hex(hex)
+            .unwrap_or_else(|| {
+                eprintln!("error: --cluster-key must be exactly 64 hex characters");
+                std::process::exit(1);
+            });
+        ClusterKey::from_bytes(bytes)
+    });
+
     let peers: Vec<SocketAddr> = args
         .peers
         .iter()
@@ -327,9 +357,14 @@ async fn main() {
         })
         .collect();
 
-    let transport = Transport::bind(args.bind)
+    let mut transport = Transport::bind(args.bind)
         .await
         .expect("failed to bind UDP socket");
+
+    if let Some(key) = cluster_key {
+        transport = transport.with_key(key);
+        log::info!("encryption enabled (ChaCha20-Poly1305)");
+    }
 
     log::info!("bound to {}", transport.local_addr);
 

@@ -1,3 +1,4 @@
+pub mod crypto;
 pub mod failure_detector;
 pub mod gossip;
 pub mod membership;

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
+use gossip_membership::crypto::ClusterKey;
 use gossip_membership::membership::MembershipTable;
 use gossip_membership::node::{NodeConfig, NodeStatus};
 use gossip_membership::transport::Transport;
@@ -165,11 +166,15 @@ pub async fn run_test_node(
     node
 }
 
-// ── Helper ─────────────────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 async fn bind_local() -> Transport {
     Transport::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .expect("bind failed")
+}
+
+async fn bind_encrypted(key: &ClusterKey) -> Transport {
+    bind_local().await.with_key(key.clone())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -749,4 +754,187 @@ async fn test_no_duplicate_entries_after_gossip() {
             );
         }
     }
+}
+
+// ── Encryption tests ────────────────────────────────────────────────────────
+
+/// Two encrypted nodes with the same cluster key should discover each other.
+#[tokio::test]
+async fn test_encrypted_two_nodes_converge() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+    let key = ClusterKey::generate();
+
+    let t1 = bind_encrypted(&key).await;
+    let t2 = bind_encrypted(&key).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    assert!(t1.is_encrypted());
+    assert!(t2.is_encrypted());
+
+    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
+    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_test_node(n1, rx1));
+    let h2 = tokio::spawn(run_test_node(n2, rx2));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+
+    assert!(
+        node1.table.entries.values().any(|e| e.node_id == id2),
+        "encrypted node1 does not know about node2"
+    );
+    assert!(
+        node2.table.entries.values().any(|e| e.node_id == id1),
+        "encrypted node2 does not know about node1"
+    );
+}
+
+/// Three encrypted nodes in a ring converge through gossip propagation.
+#[tokio::test]
+async fn test_encrypted_ring_converges() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+    let key = ClusterKey::generate();
+
+    let t1 = bind_encrypted(&key).await;
+    let t2 = bind_encrypted(&key).await;
+    let t3 = bind_encrypted(&key).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
+    let n2 = TestNode::new(t2, cfg.clone(), &[addr3]);
+    let n3 = TestNode::new(t3, cfg.clone(), &[addr1]);
+    let id1 = n1.id;
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_test_node(n1, rx1));
+    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h3 = tokio::spawn(run_test_node(n3, rx3));
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let node1 = h1.await.unwrap();
+    let _node2 = h2.await.unwrap();
+    let node3 = h3.await.unwrap();
+
+    assert!(
+        node1.table.entries.values().any(|e| e.node_id == id3),
+        "encrypted ring: node1 did not learn about node3 via gossip"
+    );
+    assert!(
+        node3.table.entries.values().any(|e| e.node_id == id1),
+        "encrypted ring: node3 did not learn about node1 via gossip"
+    );
+}
+
+/// A node with a different cluster key must NOT be able to join.
+/// The encrypted node should remain isolated — the wrong-key node's
+/// messages will fail decryption and be silently dropped.
+#[tokio::test]
+async fn test_wrong_key_node_rejected() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+    let key_good = ClusterKey::generate();
+    let key_bad = ClusterKey::generate();
+
+    let t1 = bind_encrypted(&key_good).await;
+    let t2 = bind_encrypted(&key_bad).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
+    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_test_node(n1, rx1));
+    let h2 = tokio::spawn(run_test_node(n2, rx2));
+
+    // Allow ample time — if decryption is working, they'd converge by now.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+
+    // Neither node should have learned the other's real ID.
+    assert!(
+        !node1.table.entries.values().any(|e| e.node_id == id2),
+        "node1 should NOT know node2 (different key)"
+    );
+    assert!(
+        !node2.table.entries.values().any(|e| e.node_id == id1),
+        "node2 should NOT know node1 (different key)"
+    );
+}
+
+/// An unencrypted node cannot join an encrypted cluster.
+#[tokio::test]
+async fn test_plaintext_node_rejected_by_encrypted_cluster() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+    let key = ClusterKey::generate();
+
+    let t1 = bind_encrypted(&key).await;
+    let t2 = bind_local().await; // plaintext
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
+    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_test_node(n1, rx1));
+    let h2 = tokio::spawn(run_test_node(n2, rx2));
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+
+    // Encrypted node must reject plaintext messages.
+    assert!(
+        !node1.table.entries.values().any(|e| e.node_id == id2),
+        "encrypted node should NOT accept plaintext peer"
+    );
+    // Plaintext node receives encrypted bytes which fail Message::decode.
+    assert!(
+        !node2.table.entries.values().any(|e| e.node_id == id1),
+        "plaintext node should NOT parse encrypted messages"
+    );
 }
