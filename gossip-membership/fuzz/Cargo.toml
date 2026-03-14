@@ -1,0 +1,28 @@
+[package]
+name = "gossip-membership-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.gossip-membership]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_message_decode"
+path = "fuzz_targets/fuzz_message_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wire_node_entry_decode"
+path = "fuzz_targets/fuzz_wire_node_entry_decode.rs"
+doc = false

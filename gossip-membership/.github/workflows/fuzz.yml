@@ -1,0 +1,31 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run nightly at 03:00 UTC for extended fuzzing.
+    - cron: "0 3 * * *"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - fuzz_message_decode
+          - fuzz_wire_node_entry_decode
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Fuzz ${{ matrix.target }} (30s)
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30
