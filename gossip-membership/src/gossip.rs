@@ -135,6 +135,18 @@ pub fn effective_fanout(base: usize, cluster_size: usize, adaptive: bool) -> usi
     base.saturating_mul(log2_n)
 }
 
+/// Build a full-sync GOSSIP message containing every non-placeholder entry
+/// in the table.  Used for anti-entropy rounds.
+pub fn build_full_sync_message(
+    table: &MembershipTable,
+    sender_id: NodeId,
+    sender_heartbeat: u32,
+    sender_incarnation: u32,
+) -> Message {
+    let entries = table.gossip_wire_entries(usize::MAX);
+    build_gossip(sender_id, sender_heartbeat, sender_incarnation, entries)
+}
+
 /// Build the GOSSIP message to broadcast this round.
 pub fn build_gossip_message(
     table: &MembershipTable,
@@ -528,6 +540,38 @@ mod tests {
                 let dead_entry = entries.iter().find(|e| e.node_id == 2);
                 assert!(dead_entry.is_some(), "Dead entries must be included in gossip");
                 assert_eq!(dead_entry.unwrap().status, crate::message::status::DEAD);
+            }
+            _ => panic!("expected Gossip payload"),
+        }
+    }
+
+    // ── build_full_sync_message tests ───────────────────────────────────────
+
+    #[test]
+    fn full_sync_includes_all_entries() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        for i in 2..=10u64 {
+            t.merge_entry(&NodeState::new_alive(i, make_addr(1000 + i as u16), 1));
+        }
+        let msg = build_full_sync_message(&t, 1, 0, 0);
+        match &msg.payload {
+            MessagePayload::Gossip(entries) => {
+                // All 10 entries (self + 9 peers).
+                assert_eq!(entries.len(), 10);
+            }
+            _ => panic!("expected Gossip payload"),
+        }
+    }
+
+    #[test]
+    fn full_sync_excludes_placeholders() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.add_bootstrap_peer(make_addr(9000));
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 1));
+        let msg = build_full_sync_message(&t, 1, 0, 0);
+        match &msg.payload {
+            MessagePayload::Gossip(entries) => {
+                assert_eq!(entries.len(), 2); // self + peer, no placeholder
             }
             _ => panic!("expected Gossip payload"),
         }

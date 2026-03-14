@@ -1458,3 +1458,104 @@ async fn test_indirect_probe_through_intermediary() {
         "node1 should have sent indirect probes (PING_REQ)"
     );
 }
+
+// ── Anti-entropy tests ──────────────────────────────────────────────────────
+
+/// Under heavy packet loss (50%), anti-entropy rounds should ensure
+/// convergence by periodically pushing the full membership table.
+#[tokio::test]
+async fn test_anti_entropy_ensures_convergence_under_heavy_loss() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.anti_entropy_interval_ms = 200; // frequent full syncs
+    let sim = Arc::new(Mutex::new(NetSim::new(42).with_loss(0.5)));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
+
+    // Allow extra time for convergence under heavy loss.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+    let node3 = h3.await.unwrap();
+
+    // All nodes should know all others despite 50% loss.
+    for (name, node, expected) in [
+        ("node1", &node1, vec![id2, id3]),
+        ("node2", &node2, vec![id1, id3]),
+        ("node3", &node3, vec![id1, id2]),
+    ] {
+        for eid in expected {
+            assert!(
+                node.table.entries.values().any(|e| e.node_id == eid),
+                "{name} does not know about node {eid} (anti-entropy under 50% loss)"
+            );
+        }
+    }
+
+    // At least one node should have sent anti-entropy messages.
+    let total_ae: u64 = node1.metrics.anti_entropy_sent
+        + node2.metrics.anti_entropy_sent
+        + node3.metrics.anti_entropy_sent;
+    assert!(
+        total_ae > 0,
+        "at least one node should have sent anti-entropy full syncs"
+    );
+}
+
+/// Anti-entropy counter should be zero when anti-entropy is disabled.
+#[tokio::test]
+async fn test_anti_entropy_disabled_sends_nothing() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.anti_entropy_interval_ms = 0; // disabled
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+
+    assert_eq!(node1.metrics.anti_entropy_sent, 0, "anti-entropy should be disabled");
+    assert_eq!(node2.metrics.anti_entropy_sent, 0, "anti-entropy should be disabled");
+}

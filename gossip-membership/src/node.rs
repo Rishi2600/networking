@@ -123,6 +123,10 @@ pub struct NodeConfig {
     pub piggyback_max: usize,
     /// How often to log a metrics summary (ms).  0 = disabled.
     pub metrics_log_interval_ms: u64,
+    /// How often to run an anti-entropy round (ms).  0 = disabled.
+    /// Anti-entropy pushes the full membership table to one random peer,
+    /// ensuring convergence even under sustained packet loss.
+    pub anti_entropy_interval_ms: u64,
     /// Timeout before retransmitting a REQUEST_ACK message (ms).
     pub reliable_ack_timeout_ms: u64,
     /// Maximum number of retransmission attempts for REQUEST_ACK messages.
@@ -146,6 +150,7 @@ impl Default for NodeConfig {
             dead_retention_ms: 15_000,
             piggyback_max: 6,
             metrics_log_interval_ms: 10_000,
+            anti_entropy_interval_ms: 10_000,
             reliable_ack_timeout_ms: 500,
             reliable_max_retries: 3,
         }
@@ -170,6 +175,7 @@ impl NodeConfig {
             dead_retention_ms: 1_000,
             piggyback_max: 6,
             metrics_log_interval_ms: 0, // disabled in tests
+            anti_entropy_interval_ms: 0, // disabled by default in tests
             reliable_ack_timeout_ms: 50,
             reliable_max_retries: 3,
         }

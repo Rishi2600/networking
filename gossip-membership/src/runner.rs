@@ -71,6 +71,14 @@ pub async fn run_node(
     let mut probe_tick =
         tokio::time::interval(Duration::from_millis(node.config.probe_interval_ms));
 
+    // Anti-entropy timer (disabled when interval == 0).
+    let anti_entropy_ms = node.config.anti_entropy_interval_ms;
+    let mut anti_entropy_tick = tokio::time::interval(if anti_entropy_ms > 0 {
+        Duration::from_millis(anti_entropy_ms)
+    } else {
+        Duration::from_secs(3600) // effectively disabled
+    });
+
     // Metrics logging timer (disabled when interval == 0).
     let metrics_ms = node.config.metrics_log_interval_ms;
     let mut metrics_tick = tokio::time::interval(if metrics_ms > 0 {
@@ -83,6 +91,7 @@ pub async fn run_node(
     gossip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    anti_entropy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -258,7 +267,34 @@ pub async fn run_node(
                 }
             }
 
-            // ── Branch 5: periodic metrics log ───────────────────────────────
+            // ── Branch 5: anti-entropy full sync ─────────────────────────────
+            _ = anti_entropy_tick.tick(), if anti_entropy_ms > 0 => {
+                if let Some((peer_id, peer_addr)) =
+                    gossip::pick_random_peer(&node.table, node.id)
+                {
+                    let msg = gossip::build_full_sync_message(
+                        &node.table,
+                        node.id,
+                        node.table.our_heartbeat(),
+                        node.table.our_incarnation(),
+                    );
+                    match node.transport.send_to(&msg, peer_addr).await {
+                        Ok(()) => {
+                            node.metrics.anti_entropy_sent += 1;
+                            log::debug!(
+                                "[node {}] anti-entropy full sync → peer {} @ {}",
+                                node.id, peer_id, peer_addr
+                            );
+                        }
+                        Err(e) => log::warn!(
+                            "[node {}] anti-entropy send failed to {peer_addr}: {e}",
+                            node.id
+                        ),
+                    }
+                }
+            }
+
+            // ── Branch 6: periodic metrics log ───────────────────────────────
             _ = metrics_tick.tick(), if metrics_ms > 0 => {
                 let (alive, suspect, dead) = node.table.status_counts();
                 log::info!(

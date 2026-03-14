@@ -55,6 +55,10 @@ pub struct Metrics {
     /// Incoming entries rejected as stale (merge conflicts).
     pub merges_stale: u64,
 
+    // ── Anti-entropy ──────────────────────────────────────────────────────
+    /// Full-sync anti-entropy messages sent.
+    pub anti_entropy_sent: u64,
+
     // ── Reliable delivery ───────────────────────────────────────────────────
     /// REQUEST_ACK messages retransmitted after timeout.
     pub reliable_retries: u64,
@@ -81,6 +85,7 @@ impl Metrics {
              ping_reqs_sent={} ping_reqs_recv={} \
              probe_direct_timeouts={} probe_failures={} \
              merges_new={} merges_updated={} merges_stale={} \
+             anti_entropy_sent={} \
              reliable_retries={} reliable_exhausted={} \
              alive={} suspect={} dead={}",
             self.gossip_rounds,
@@ -97,6 +102,7 @@ impl Metrics {
             self.merges_new,
             self.merges_updated,
             self.merges_stale,
+            self.anti_entropy_sent,
             self.reliable_retries,
             self.reliable_exhausted,
             alive,
