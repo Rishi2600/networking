@@ -2006,6 +2006,80 @@ async fn test_metrics_http_endpoint() {
     h2.await.unwrap();
 }
 
+/// Helper: send an HTTP GET request and return the full response as a string.
+async fn http_get(port: u16, path: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("should connect to metrics server");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    tokio::io::AsyncWriteExt::write_all(&mut stream, req.as_bytes())
+        .await
+        .unwrap();
+    let mut resp = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp)
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&resp).to_string()
+}
+
+/// /healthz, /readyz, and /membership endpoints return correct JSON.
+#[tokio::test]
+async fn test_operational_endpoints() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.metrics_log_interval_ms = 100;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    cfg.metrics_server_port = metrics_port;
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let mut cfg2 = cfg.clone();
+    cfg2.metrics_server_port = 0;
+    let n2 = Node::new(t2, cfg2, &[addr1]);
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+
+    // Let nodes converge and snapshot update.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // ── /healthz ──
+    let resp = http_get(metrics_port, "/healthz").await;
+    assert!(resp.contains("200 OK"), "/healthz should return 200");
+    assert!(resp.contains("application/json"), "/healthz should be JSON");
+    assert!(resp.contains(r#""status":"ok""#), "/healthz body");
+
+    // ── /readyz ──
+    let resp = http_get(metrics_port, "/readyz").await;
+    assert!(resp.contains("200 OK"), "/readyz should return 200");
+    assert!(resp.contains(r#""alive_nodes":"#), "/readyz should have alive_nodes");
+    assert!(resp.contains(r#""suspect_nodes":"#), "/readyz should have suspect_nodes");
+    assert!(resp.contains(r#""dead_nodes":"#), "/readyz should have dead_nodes");
+
+    // ── /membership ──
+    let resp = http_get(metrics_port, "/membership").await;
+    assert!(resp.contains("200 OK"), "/membership should return 200");
+    assert!(resp.contains(r#""nodes":["#), "/membership should have nodes array");
+    assert!(resp.contains(r#""status":"alive""#), "should list alive nodes");
+    assert!(resp.contains(r#""id":""#), "should list node ids");
+    assert!(resp.contains(r#""addr":""#), "should list node addrs");
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    h1.await.unwrap();
+    h2.await.unwrap();
+}
+
 // ── Inbound rate limiting tests ─────────────────────────────────────────────
 
 /// A peer sending 1000 packets rapidly should have most of them dropped

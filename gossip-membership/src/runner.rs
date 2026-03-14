@@ -78,6 +78,14 @@ impl Node {
     }
 }
 
+/// One member entry for the /membership endpoint.
+#[derive(Clone)]
+struct MemberInfo {
+    id: u64,
+    addr: SocketAddr,
+    status: &'static str,
+}
+
 /// Snapshot of metrics + cluster status for the HTTP endpoint.
 #[derive(Clone, Default)]
 struct MetricsSnapshot {
@@ -85,6 +93,17 @@ struct MetricsSnapshot {
     alive: usize,
     suspect: usize,
     dead: usize,
+    members: Vec<MemberInfo>,
+}
+
+impl Default for MemberInfo {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            status: "unknown",
+        }
+    }
 }
 
 /// Serve Prometheus metrics over HTTP on the given port.
@@ -120,7 +139,25 @@ async fn metrics_server(port: u16, shared: Arc<Mutex<MetricsSnapshot>>) {
 
         let snap = shared.lock().unwrap().clone();
 
-        let (content_type, body) = if req.contains("/json") || req.contains("json") {
+        // Extract the request path from the first line: "GET /path HTTP/1.1"
+        let path = req.split_whitespace().nth(1).unwrap_or("/");
+
+        let (content_type, body) = if path == "/healthz" {
+            ("application/json", r#"{"status":"ok"}"#.to_string())
+        } else if path == "/readyz" {
+            ("application/json", format!(
+                r#"{{"alive_nodes":{},"suspect_nodes":{},"dead_nodes":{}}}"#,
+                snap.alive, snap.suspect, snap.dead,
+            ))
+        } else if path == "/membership" {
+            let nodes: Vec<String> = snap.members.iter().map(|m| {
+                format!(
+                    r#"{{"id":"{}","addr":"{}","status":"{}"}}"#,
+                    m.id, m.addr, m.status,
+                )
+            }).collect();
+            ("application/json", format!(r#"{{"nodes":[{}]}}"#, nodes.join(",")))
+        } else if path.contains("json") {
             ("application/json", snap.metrics.json(snap.alive, snap.suspect, snap.dead))
         } else {
             ("text/plain; version=0.0.4; charset=utf-8",
@@ -412,11 +449,23 @@ pub async fn run_node(
                 );
                 // Update shared snapshot for the HTTP server.
                 if node.config.metrics_server_port > 0 {
+                    let members: Vec<MemberInfo> = node.table.entries.values()
+                        .map(|e| MemberInfo {
+                            id: e.node_id,
+                            addr: e.addr,
+                            status: match e.status {
+                                crate::node::NodeStatus::Alive => "alive",
+                                crate::node::NodeStatus::Suspect => "suspect",
+                                crate::node::NodeStatus::Dead => "dead",
+                            },
+                        })
+                        .collect();
                     let mut snap = metrics_shared.lock().unwrap();
                     snap.metrics = node.metrics.clone();
                     snap.alive = alive;
                     snap.suspect = suspect;
                     snap.dead = dead;
+                    snap.members = members;
                 }
             }
         }
