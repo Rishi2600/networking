@@ -3,8 +3,11 @@
 /// Contains the `Node` struct (protocol state) and `run_node` (event loop).
 /// The binary crate adds CLI parsing; integration tests use `Node` directly.
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use crate::failure_detector::FailureDetector;
@@ -57,6 +60,64 @@ impl Node {
     }
 }
 
+/// Snapshot of metrics + cluster status for the HTTP endpoint.
+#[derive(Clone, Default)]
+struct MetricsSnapshot {
+    metrics: crate::metrics::Metrics,
+    alive: usize,
+    suspect: usize,
+    dead: usize,
+}
+
+/// Serve Prometheus metrics over HTTP on the given port.
+///
+/// Runs until the `shutdown` future completes.  Responds to any request
+/// path containing "json" with JSON, everything else with Prometheus text.
+async fn metrics_server(port: u16, shared: Arc<Mutex<MetricsSnapshot>>) {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => {
+            log::info!("[metrics-server] listening on {}", l.local_addr().unwrap());
+            l
+        }
+        Err(e) => {
+            log::warn!("[metrics-server] failed to bind {addr}: {e}");
+            return;
+        }
+    };
+
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Read enough of the request to determine the path.
+        let mut req_buf = vec![0u8; 512];
+        let n = match tokio::io::AsyncReadExt::read(&mut stream, &mut req_buf).await {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let req = String::from_utf8_lossy(&req_buf[..n]);
+
+        let snap = shared.lock().unwrap().clone();
+
+        let (content_type, body) = if req.contains("/json") || req.contains("json") {
+            ("application/json", snap.metrics.json(snap.alive, snap.suspect, snap.dead))
+        } else {
+            ("text/plain; version=0.0.4; charset=utf-8",
+             snap.metrics.prometheus(snap.alive, snap.suspect, snap.dead))
+        };
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+}
+
 // ── Event loop ─────────────────────────────────────────────────────────────────
 /// Run a node until `shutdown_rx` fires. Returns the final `Node` so callers
 /// (e.g. tests) can inspect the membership table and metrics.
@@ -64,6 +125,16 @@ pub async fn run_node(
     mut node: Node,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Node {
+    // Start metrics HTTP server if configured.
+    let metrics_shared = Arc::new(Mutex::new(MetricsSnapshot::default()));
+    if node.config.metrics_server_port > 0 {
+        let shared = metrics_shared.clone();
+        let port = node.config.metrics_server_port;
+        tokio::spawn(async move {
+            metrics_server(port, shared).await;
+        });
+    }
+
     let mut gossip_tick =
         tokio::time::interval(Duration::from_millis(node.config.gossip_interval_ms));
     let mut hb_tick =
@@ -306,6 +377,14 @@ pub async fn run_node(
                     "[metrics] {}",
                     node.metrics.summary(alive, suspect, dead)
                 );
+                // Update shared snapshot for the HTTP server.
+                if node.config.metrics_server_port > 0 {
+                    let mut snap = metrics_shared.lock().unwrap();
+                    snap.metrics = node.metrics.clone();
+                    snap.alive = alive;
+                    snap.suspect = suspect;
+                    snap.dead = dead;
+                }
             }
         }
     }

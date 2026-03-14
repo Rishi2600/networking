@@ -40,6 +40,11 @@ struct Args {
     /// Generate a random cluster key, print it, and exit.
     #[arg(long)]
     generate_key: bool,
+
+    /// TCP port for the Prometheus-compatible HTTP metrics endpoint.
+    /// Serves /metrics (Prometheus text) and /metrics/json (JSON).
+    #[arg(long, default_value = "0")]
+    metrics_port: u16,
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────
@@ -86,7 +91,10 @@ async fn main() {
 
     log::info!("bound to {}", transport.local_addr);
 
-    let config = NodeConfig::default();
+    let mut config = NodeConfig::default();
+    if args.metrics_port > 0 {
+        config.metrics_server_port = args.metrics_port;
+    }
     let node = Node::new(transport, config, &peers);
 
     // The main binary runs until Ctrl-C.

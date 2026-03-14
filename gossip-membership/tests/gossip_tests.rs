@@ -1927,3 +1927,81 @@ async fn test_join_during_partition_then_heal() {
         );
     }
 }
+
+// ── Metrics HTTP endpoint tests ─────────────────────────────────────────────
+
+/// The metrics HTTP server should respond with Prometheus text format on
+/// GET /metrics and JSON on GET /metrics/json.
+#[tokio::test]
+async fn test_metrics_http_endpoint() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.metrics_log_interval_ms = 100; // frequent snapshot updates
+    cfg.metrics_server_port = 0; // will pick a free port
+
+    // Bind the metrics server on a free port by finding one.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_port = listener.local_addr().unwrap().port();
+    drop(listener); // release it so the runner can bind
+    cfg.metrics_server_port = metrics_port;
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let mut cfg2 = cfg.clone();
+    cfg2.metrics_server_port = 0; // only node1 runs the server
+    let n2 = Node::new(t2, cfg2, &[addr1]);
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+
+    // Let nodes gossip and the metrics server start + get a snapshot.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Query the Prometheus endpoint.
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{metrics_port}"))
+        .await
+        .expect("should connect to metrics server");
+    tokio::io::AsyncWriteExt::write_all(
+        &mut stream,
+        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp).await.unwrap();
+    let body = String::from_utf8_lossy(&resp);
+
+    assert!(body.contains("HTTP/1.1 200 OK"), "should return 200");
+    assert!(body.contains("text/plain"), "should be Prometheus content type");
+    assert!(body.contains("swim_gossip_rounds_total"), "should contain Prometheus counter");
+    assert!(body.contains("# TYPE swim_members_alive gauge"), "should contain gauge type");
+
+    // Query the JSON endpoint.
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{metrics_port}"))
+        .await
+        .expect("should connect to metrics server");
+    tokio::io::AsyncWriteExt::write_all(
+        &mut stream,
+        b"GET /metrics/json HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp).await.unwrap();
+    let body = String::from_utf8_lossy(&resp);
+
+    assert!(body.contains("application/json"), "should be JSON content type");
+    assert!(body.contains(r#""gossip_rounds":"#), "should contain JSON field");
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    h1.await.unwrap();
+    h2.await.unwrap();
+}
