@@ -111,22 +111,7 @@ impl Transport {
     /// with ChaCha20-Poly1305 before being sent.  The sender's node ID
     /// is bound as Additional Authenticated Data (AAD).
     pub async fn send_to(&self, msg: &Message, dest: SocketAddr) -> Result<(), TransportError> {
-        // Consult the network simulator (if any) before sending.
-        // Extract the decision and delay while holding the lock, then drop
-        // the guard before any .await to keep the future Send.
-        if let Some(sim) = &self.sim {
-            let (deliver, delay) = {
-                let mut s = sim.lock().unwrap();
-                (s.should_deliver(self.local_addr, dest), s.delay_ms())
-            };
-            if !deliver {
-                return Ok(()); // silently drop
-            }
-            if delay > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            }
-        }
-
+        // Encode first so we have wire bytes for potential reorder buffering.
         let encoded = msg.encode().map_err(TransportError::Message)?;
         let wire_bytes = match &self.key {
             Some(key) => key
@@ -134,6 +119,49 @@ impl Transport {
                 .map_err(TransportError::Crypto)?,
             None => encoded,
         };
+
+        // Consult the network simulator (if any) before sending.
+        // Extract decisions while holding the lock, then drop the guard
+        // before any .await to keep the future Send.
+        if let Some(sim) = &self.sim {
+            let (deliver, delay, reorder, flush) = {
+                let mut s = sim.lock().unwrap();
+                let deliver = s.should_deliver(self.local_addr, dest);
+                let delay = s.delay_ms();
+                if !deliver {
+                    (false, 0, false, None)
+                } else if s.should_reorder() {
+                    // Stash this packet; send a previously-buffered one instead.
+                    let released = s.stash(wire_bytes.clone(), dest);
+                    (false, delay, true, released)
+                } else {
+                    // Normal send; also flush one buffered packet.
+                    let released = s.flush_one();
+                    (true, delay, false, released)
+                }
+            };
+
+            if !deliver && !reorder {
+                return Ok(()); // dropped by loss/partition
+            }
+
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+
+            // Send a released (reordered) packet if any.
+            if let Some((buf, dst)) = flush {
+                self.socket.send_to(&buf, dst).await?;
+            }
+
+            if !reorder {
+                // Normal path: send the current packet.
+                self.socket.send_to(&wire_bytes, dest).await?;
+            }
+            return Ok(());
+        }
+
+        // No simulator — send directly.
         self.socket.send_to(&wire_bytes, dest).await?;
         Ok(())
     }

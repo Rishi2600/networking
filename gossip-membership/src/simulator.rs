@@ -9,7 +9,7 @@
 ///
 /// All randomness is driven by a deterministic SplitMix64 PRNG seeded at
 /// construction, so simulations are reproducible.
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 
 // ── Deterministic PRNG (SplitMix64) ─────────────────────────────────────────
@@ -44,6 +44,12 @@ pub struct NetSim {
     delay_ms: u64,
     /// Bidirectional partitions stored as canonical `(min, max)` pairs.
     partitions: HashSet<(SocketAddr, SocketAddr)>,
+    /// Probability [0.0, 1.0] that a packet is stashed for reordering.
+    reorder_prob: f64,
+    /// Max packets held in the reorder buffer before forced flush.
+    reorder_window: usize,
+    /// Packets held for out-of-order delivery: `(wire_bytes, dest)`.
+    reorder_buf: VecDeque<(Vec<u8>, SocketAddr)>,
 }
 
 impl NetSim {
@@ -53,6 +59,9 @@ impl NetSim {
             loss_rate: 0.0,
             delay_ms: 0,
             partitions: HashSet::new(),
+            reorder_prob: 0.0,
+            reorder_window: 0,
+            reorder_buf: VecDeque::new(),
         }
     }
 
@@ -65,6 +74,12 @@ impl NetSim {
 
     pub fn with_delay_ms(mut self, ms: u64) -> Self {
         self.delay_ms = ms;
+        self
+    }
+
+    pub fn with_reorder(mut self, probability: f64, window: usize) -> Self {
+        self.reorder_prob = probability.clamp(0.0, 1.0);
+        self.reorder_window = window;
         self
     }
 
@@ -117,6 +132,41 @@ impl NetSim {
     /// Configured delay in milliseconds.
     pub fn delay_ms(&self) -> u64 {
         self.delay_ms
+    }
+
+    /// Decide whether this packet should be stashed for reordering.
+    ///
+    /// Returns `true` if the packet should be held in the buffer (and a
+    /// previously-buffered packet released instead).
+    pub fn should_reorder(&mut self) -> bool {
+        if self.reorder_prob > 0.0 && self.reorder_window > 0 {
+            self.rng.next_f64() < self.reorder_prob
+        } else {
+            false
+        }
+    }
+
+    /// Stash a packet for later out-of-order delivery.
+    ///
+    /// If the buffer exceeds `reorder_window`, the oldest packet is
+    /// returned for immediate delivery (cap-bypass).
+    pub fn stash(&mut self, wire: Vec<u8>, dest: SocketAddr) -> Option<(Vec<u8>, SocketAddr)> {
+        self.reorder_buf.push_back((wire, dest));
+        if self.reorder_buf.len() > self.reorder_window {
+            self.reorder_buf.pop_front()
+        } else {
+            None
+        }
+    }
+
+    /// Release the oldest buffered packet (if any) for delivery.
+    pub fn flush_one(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
+        self.reorder_buf.pop_front()
+    }
+
+    /// Number of packets currently held for reordering.
+    pub fn reorder_pending(&self) -> usize {
+        self.reorder_buf.len()
     }
 
     // ── Internal ─────────────────────────────────────────────────────────
@@ -306,6 +356,90 @@ mod tests {
         let mut sim = NetSim::new(0);
         sim.set_delay_ms(100);
         assert_eq!(sim.delay_ms(), 100);
+    }
+
+    // ── Combined ─────────────────────────────────────────────────────────
+
+    // ── Reorder ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn reorder_disabled_by_default() {
+        let mut sim = NetSim::new(0);
+        for _ in 0..100 {
+            assert!(!sim.should_reorder());
+        }
+    }
+
+    #[test]
+    fn reorder_full_probability_always_reorders() {
+        let mut sim = NetSim::new(0).with_reorder(1.0, 5);
+        for _ in 0..20 {
+            assert!(sim.should_reorder());
+        }
+    }
+
+    #[test]
+    fn reorder_stash_and_flush() {
+        let mut sim = NetSim::new(0).with_reorder(1.0, 5);
+        // Stash 3 packets (window=5, so no cap-bypass yet).
+        assert!(sim.stash(vec![1], addr(100)).is_none());
+        assert!(sim.stash(vec![2], addr(200)).is_none());
+        assert!(sim.stash(vec![3], addr(300)).is_none());
+        assert_eq!(sim.reorder_pending(), 3);
+
+        // Flush returns oldest first.
+        let (buf, dst) = sim.flush_one().unwrap();
+        assert_eq!(buf, vec![1]);
+        assert_eq!(dst, addr(100));
+        assert_eq!(sim.reorder_pending(), 2);
+    }
+
+    #[test]
+    fn reorder_cap_bypass_releases_oldest() {
+        let mut sim = NetSim::new(0).with_reorder(1.0, 2);
+        assert!(sim.stash(vec![1], addr(100)).is_none());
+        assert!(sim.stash(vec![2], addr(200)).is_none());
+        // 3rd stash exceeds window=2 → oldest (vec![1]) is released.
+        let released = sim.stash(vec![3], addr(300));
+        assert!(released.is_some());
+        assert_eq!(released.unwrap().0, vec![1]);
+        assert_eq!(sim.reorder_pending(), 2);
+    }
+
+    #[test]
+    fn reorder_deterministic_same_seed() {
+        let decisions_a: Vec<bool> = {
+            let mut sim = NetSim::new(42).with_reorder(0.5, 5);
+            (0..50).map(|_| sim.should_reorder()).collect()
+        };
+        let decisions_b: Vec<bool> = {
+            let mut sim = NetSim::new(42).with_reorder(0.5, 5);
+            (0..50).map(|_| sim.should_reorder()).collect()
+        };
+        assert_eq!(decisions_a, decisions_b);
+    }
+
+    #[test]
+    fn reorder_partial_probability_mixes() {
+        let mut sim = NetSim::new(99).with_reorder(0.5, 10);
+        let mut reordered = 0;
+        for _ in 0..200 {
+            if sim.should_reorder() {
+                reordered += 1;
+            }
+        }
+        // ~50% should be reordered.
+        assert!(reordered > 50 && reordered < 150,
+            "expected ~100 reordered, got {reordered}");
+    }
+
+    #[test]
+    fn reorder_zero_window_never_reorders() {
+        let mut sim = NetSim::new(0).with_reorder(1.0, 0);
+        // Window=0 disables reordering.
+        for _ in 0..100 {
+            assert!(!sim.should_reorder());
+        }
     }
 
     // ── Combined ─────────────────────────────────────────────────────────

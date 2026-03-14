@@ -2057,3 +2057,120 @@ async fn test_inbound_rate_limiting_drops_flood() {
         "expected >=900 packets dropped by rate limiter, got {dropped}"
     );
 }
+
+// ── Packet reorder tests ────────────────────────────────────────────────────
+
+/// Under 80% reorder probability, three nodes should still converge
+/// (gossip tolerates out-of-order delivery).
+#[tokio::test]
+async fn test_convergence_under_reorder() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+    let sim = Arc::new(Mutex::new(
+        NetSim::new(42).with_reorder(0.8, 5),
+    ));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
+
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+    let node3 = h3.await.unwrap();
+
+    for (name, node, expected) in [
+        ("node1", &node1, vec![id2, id3]),
+        ("node2", &node2, vec![id1, id3]),
+        ("node3", &node3, vec![id1, id2]),
+    ] {
+        for eid in expected {
+            assert!(
+                node.table.entries.values().any(|e| e.node_id == eid),
+                "{name} does not know about node {eid} (under 80% reorder)"
+            );
+        }
+    }
+}
+
+/// Indirect probes (PING_REQ) should still work under reordering:
+/// when direct path is partitioned, node1 should keep node3 Alive
+/// via node2 even with moderate reordering.
+#[tokio::test]
+async fn test_indirect_probes_under_reorder() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.probe_timeout_ms = 150;
+    cfg.suspect_timeout_ms = 800;
+    cfg.indirect_probe_k = 2;
+    let sim = Arc::new(Mutex::new(
+        NetSim::new(0).with_reorder(0.3, 2),
+    ));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let _h2 = tokio::spawn(run_node(n2, rx2));
+    let _h3 = tokio::spawn(run_node(n3, rx3));
+
+    // Converge first.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Partition node1 <-> node3 (indirect probes go through node2).
+    sim.lock().unwrap().add_partition(addr1, addr3);
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let node1 = h1.await.unwrap();
+
+    let status = node1
+        .table
+        .entries
+        .values()
+        .find(|e| e.node_id == id3)
+        .map(|e| e.status);
+    assert!(
+        matches!(status, Some(NodeStatus::Alive)),
+        "node3 should be Alive on node1 via indirect probes under reorder, got {status:?}"
+    );
+}
