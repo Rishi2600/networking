@@ -9,9 +9,12 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
+use std::sync::{Arc, Mutex};
+
 use gossip_membership::crypto::ClusterKey;
 use gossip_membership::node::{NodeConfig, NodeStatus};
 use gossip_membership::runner::{run_node, Node};
+use gossip_membership::simulator::NetSim;
 use gossip_membership::transport::Transport;
 
 use gossip_membership::membership::placeholder_id_for;
@@ -25,6 +28,10 @@ async fn bind_local() -> Transport {
 
 async fn bind_encrypted(key: &ClusterKey) -> Transport {
     bind_local().await.with_key(key.clone())
+}
+
+async fn bind_sim(sim: &Arc<Mutex<NetSim>>) -> Transport {
+    bind_local().await.with_sim(sim.clone())
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1136,5 +1143,318 @@ async fn test_request_ack_retries_on_timeout() {
     assert!(
         matches!(node2_status, Some(NodeStatus::Suspect) | Some(NodeStatus::Dead)),
         "node2 should be Suspect or Dead on node1 after silence"
+    );
+}
+
+// ── Network simulator tests ─────────────────────────────────────────────────
+
+/// Under 30% packet loss, three fully-seeded nodes should still converge
+/// given enough gossip rounds.
+#[tokio::test]
+async fn test_convergence_under_loss() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+    let sim = Arc::new(Mutex::new(NetSim::new(42).with_loss(0.3)));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
+
+    // Allow extra time for convergence under loss.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+    let node3 = h3.await.unwrap();
+
+    for (name, node, expected) in [
+        ("node1", &node1, vec![id2, id3]),
+        ("node2", &node2, vec![id1, id3]),
+        ("node3", &node3, vec![id1, id2]),
+    ] {
+        for eid in expected {
+            assert!(
+                node.table.entries.values().any(|e| e.node_id == eid),
+                "{name} does not know about node {eid} (under 30% loss)"
+            );
+        }
+    }
+}
+
+/// When the direct path between node1 and node3 is partitioned but both
+/// can reach node2, node1 should still learn about node3 via gossip
+/// propagation through node2 (indirect dissemination).
+#[tokio::test]
+async fn test_convergence_through_indirect_path() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+    let sim = Arc::new(Mutex::new(NetSim::new(0)));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    // Partition: node1 <-> node3 blocked.
+    sim.lock().unwrap().add_partition(addr1, addr3);
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
+    let id1 = n1.id;
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let _h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
+
+    // Allow time for gossip to propagate via node2.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let node1 = h1.await.unwrap();
+    let node3 = h3.await.unwrap();
+
+    // node1 should know about node3 via gossip through node2.
+    assert!(
+        node1.table.entries.values().any(|e| e.node_id == id3),
+        "node1 must learn about node3 through indirect gossip via node2"
+    );
+    // And vice versa.
+    assert!(
+        node3.table.entries.values().any(|e| e.node_id == id1),
+        "node3 must learn about node1 through indirect gossip via node2"
+    );
+}
+
+/// When a partition is introduced after convergence, the failure detector
+/// should mark the isolated node as Suspect.  When the partition heals
+/// before the suspect timeout expires, the node should be rediscovered
+/// as Alive (the incoming heartbeats update the entry).
+#[tokio::test]
+async fn test_partition_heal_restores_liveness() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.probe_timeout_ms = 50;
+    // Long suspect timeout so the node stays Suspect (not Dead) during
+    // the partition window.
+    cfg.suspect_timeout_ms = 5_000;
+    let sim = Arc::new(Mutex::new(NetSim::new(0)));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
+    let id2 = n2.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let _h2 = tokio::spawn(run_node(n2, rx2));
+
+    // Phase 1: converge normally.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Phase 2: partition them (short enough that suspect_timeout doesn't fire).
+    sim.lock().unwrap().add_partition(addr1, addr2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Phase 3: heal the partition — fresh messages should restore Alive.
+    sim.lock().unwrap().remove_partition(addr1, addr2);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+
+    let node1 = h1.await.unwrap();
+
+    let status = node1
+        .table
+        .entries
+        .values()
+        .find(|e| e.node_id == id2)
+        .map(|e| e.status);
+
+    assert_eq!(
+        status,
+        Some(NodeStatus::Alive),
+        "node2 should be Alive after partition heals, got {status:?}"
+    );
+}
+
+/// A fully isolated node (partitioned from all peers) should be detected
+/// as Suspect or Dead by the remaining cluster.
+#[tokio::test]
+async fn test_full_isolation_detected() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.probe_timeout_ms = 50;
+    cfg.suspect_timeout_ms = 200;
+    let sim = Arc::new(Mutex::new(NetSim::new(0)));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let _h3 = tokio::spawn(run_node(n3, rx3));
+
+    // Phase 1: converge.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Phase 2: fully isolate node3.
+    {
+        let mut s = sim.lock().unwrap();
+        s.add_partition(addr3, addr1);
+        s.add_partition(addr3, addr2);
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+
+    // node3 should be Suspect or Dead on node1 and node2.
+    for (name, node) in [("node1", &node1), ("node2", &node2)] {
+        let status = node
+            .table
+            .entries
+            .values()
+            .find(|e| e.node_id == id3)
+            .map(|e| e.status);
+        assert!(
+            matches!(status, Some(NodeStatus::Suspect) | Some(NodeStatus::Dead)),
+            "{name} should see node3 as Suspect or Dead after isolation, got {status:?}"
+        );
+    }
+
+    // node1 and node2 should still see each other as Alive.
+    assert!(
+        node1.table.entries.values().any(|e| e.node_id == id2 && e.status == NodeStatus::Alive),
+        "node1 should still see node2 as Alive"
+    );
+    assert!(
+        node2.table.entries.values().any(|e| e.node_id == id1 && e.status == NodeStatus::Alive),
+        "node2 should still see node1 as Alive"
+    );
+}
+
+/// SWIM indirect probes (PING_REQ): when the direct path from node1 to
+/// node3 is partitioned, node1 should use node2 as an intermediary to
+/// probe node3.  Node3 should remain Alive on node1.
+#[tokio::test]
+async fn test_indirect_probe_through_intermediary() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.probe_timeout_ms = 80;
+    cfg.suspect_timeout_ms = 500;
+    cfg.indirect_probe_k = 2;
+    let sim = Arc::new(Mutex::new(NetSim::new(0)));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let _h2 = tokio::spawn(run_node(n2, rx2));
+    let _h3 = tokio::spawn(run_node(n3, rx3));
+
+    // Phase 1: converge.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Phase 2: partition node1 <-> node3 (but both can still reach node2).
+    sim.lock().unwrap().add_partition(addr1, addr3);
+
+    // Allow time for direct probe to timeout and indirect probe via node2.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let node1 = h1.await.unwrap();
+
+    // node3 should still be Alive on node1, kept alive by indirect
+    // probes (PING_REQ through node2) and gossip propagation.
+    let status = node1
+        .table
+        .entries
+        .values()
+        .find(|e| e.node_id == id3)
+        .map(|e| e.status);
+    assert!(
+        matches!(status, Some(NodeStatus::Alive)),
+        "node3 should be Alive on node1 via indirect probes, got {status:?}"
+    );
+
+    // node1 should have sent at least one PING_REQ.
+    assert!(
+        node1.metrics.ping_reqs_sent > 0,
+        "node1 should have sent indirect probes (PING_REQ)"
     );
 }

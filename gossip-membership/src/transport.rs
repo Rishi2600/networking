@@ -9,12 +9,13 @@
 /// discarded (the call loops and waits for the next datagram), matching
 /// the behaviour of `SimulatedSocket` in tcp-over-udp.
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
 
 use crate::crypto::{ClusterKey, CryptoError};
 use crate::message::{Message, MessageError};
+use crate::simulator::NetSim;
 
 /// Practical UDP MTU ceiling — avoids fragmentation on most Ethernet paths.
 const MAX_DATAGRAM: usize = 1_472;
@@ -54,6 +55,7 @@ pub struct Transport {
     pub local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
     key: Option<ClusterKey>,
+    sim: Option<Arc<Mutex<NetSim>>>,
 }
 
 impl Transport {
@@ -65,12 +67,19 @@ impl Transport {
             local_addr,
             socket: Arc::new(socket),
             key: None,
+            sim: None,
         })
     }
 
     /// Attach a cluster key, enabling encryption on all subsequent I/O.
     pub fn with_key(mut self, key: ClusterKey) -> Self {
         self.key = Some(key);
+        self
+    }
+
+    /// Attach a network simulator for testing under adverse conditions.
+    pub fn with_sim(mut self, sim: Arc<Mutex<NetSim>>) -> Self {
+        self.sim = Some(sim);
         self
     }
 
@@ -90,6 +99,22 @@ impl Transport {
     /// with ChaCha20-Poly1305 before being sent.  The sender's node ID
     /// is bound as Additional Authenticated Data (AAD).
     pub async fn send_to(&self, msg: &Message, dest: SocketAddr) -> Result<(), TransportError> {
+        // Consult the network simulator (if any) before sending.
+        // Extract the decision and delay while holding the lock, then drop
+        // the guard before any .await to keep the future Send.
+        if let Some(sim) = &self.sim {
+            let (deliver, delay) = {
+                let mut s = sim.lock().unwrap();
+                (s.should_deliver(self.local_addr, dest), s.delay_ms())
+            };
+            if !deliver {
+                return Ok(()); // silently drop
+            }
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+        }
+
         let encoded = msg.encode().map_err(TransportError::Message)?;
         let wire_bytes = match &self.key {
             Some(key) => key

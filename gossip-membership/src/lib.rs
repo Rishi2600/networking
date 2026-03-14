@@ -7,4 +7,5 @@ pub mod metrics;
 pub mod node;
 pub mod reliable;
 pub mod runner;
+pub mod simulator;
 pub mod transport;
