@@ -9,12 +9,16 @@
 ///
 ///   # Join an existing cluster:
 ///   cargo run -- --bind 127.0.0.1:7001 --peers 127.0.0.1:7000 --cluster-key <HEX>
-///   cargo run -- --bind 127.0.0.1:7002 --peers 127.0.0.1:7000,127.0.0.1:7001 --cluster-key <HEX>
+///
+///   # Load configuration from a TOML file:
+///   cargo run -- --config gossip.toml --bind 127.0.0.1:7000
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use clap::Parser;
 use tokio::sync::oneshot;
 
+use gossip_membership::config::FileConfig;
 use gossip_membership::crypto::{self, ClusterKey};
 use gossip_membership::node::NodeConfig;
 use gossip_membership::runner::{run_node, Node};
@@ -24,6 +28,10 @@ use gossip_membership::transport::Transport;
 #[derive(Parser, Debug)]
 #[command(name = "gossip-membership", about = "Gossip-based distributed membership protocol")]
 struct Args {
+    /// Path to a TOML configuration file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Local address to bind (e.g. 127.0.0.1:7000)
     #[arg(long, default_value = "127.0.0.1:0")]
     bind: SocketAddr,
@@ -43,8 +51,8 @@ struct Args {
 
     /// TCP port for the Prometheus-compatible HTTP metrics endpoint.
     /// Serves /metrics (Prometheus text) and /metrics/json (JSON).
-    #[arg(long, default_value = "0")]
-    metrics_port: u16,
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────
@@ -61,11 +69,39 @@ async fn main() {
         return;
     }
 
-    // Parse optional cluster key.
-    let cluster_key: Option<ClusterKey> = args.cluster_key.as_deref().map(|hex| {
+    // ── Build config: defaults → file → CLI ──────────────────────────────
+    let mut config = NodeConfig::default();
+
+    // Layer 2: config file (if provided).
+    let file_config = if let Some(ref path) = args.config {
+        match FileConfig::load(path) {
+            Ok(fc) => {
+                log::info!("loaded config from {}", path.display());
+                fc
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        FileConfig::default()
+    };
+    file_config.apply(&mut config);
+
+    // Layer 3: CLI flags override file values.
+    if let Some(port) = args.metrics_port {
+        config.metrics_server_port = port;
+    }
+
+    // ── Cluster key: CLI flag > file config ──────────────────────────────
+    let key_hex = args.cluster_key.as_deref()
+        .or(file_config.network.cluster_key.as_deref());
+
+    let cluster_key: Option<ClusterKey> = key_hex.map(|hex| {
         let bytes = crypto::key_from_hex(hex)
             .unwrap_or_else(|| {
-                eprintln!("error: --cluster-key must be exactly 64 hex characters");
+                eprintln!("error: cluster key must be exactly 64 hex characters");
                 std::process::exit(1);
             });
         ClusterKey::from_bytes(bytes)
@@ -91,10 +127,6 @@ async fn main() {
 
     log::info!("bound to {}", transport.local_addr);
 
-    let mut config = NodeConfig::default();
-    if args.metrics_port > 0 {
-        config.metrics_server_port = args.metrics_port;
-    }
     let node = Node::new(transport, config, &peers);
 
     // The main binary runs until Ctrl-C.

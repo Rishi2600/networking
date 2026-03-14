@@ -1,0 +1,39 @@
+# Example gossip-membership configuration file.
+#
+# All fields are optional — missing fields use built-in defaults.
+# CLI flags take precedence over file values.
+#
+# Usage:
+#   cargo run -- --config gossip.toml --bind 127.0.0.1:7000
+
+[gossip]
+fanout = 50                    # max entries per gossip message
+adaptive_fanout = true         # scale fanout with cluster size
+max_sends = 1                  # gossip targets per round
+adaptive_targets = true        # scale targets with cluster size
+interval_ms = 200              # gossip round interval
+heartbeat_interval_ms = 500    # heartbeat increment interval
+piggyback_max = 6              # max entries piggybacked on PING/ACK
+anti_entropy_interval_ms = 10000  # full table sync interval (0 = disabled)
+
+[network]
+# encryption = true            # uncomment and set cluster_key to enable
+# cluster_key = "abcdef..."    # 64 hex chars (256-bit ChaCha20-Poly1305)
+max_inbound_rate = 500         # global inbound rate limit (tokens/sec)
+inbound_peer_capacity = 100    # per-peer burst capacity
+inbound_peer_refill_rate = 50  # per-peer refill rate (tokens/sec)
+reliable_ack_timeout_ms = 500  # REQUEST_ACK retry timeout
+reliable_max_retries = 3       # max REQUEST_ACK retransmissions
+
+[probes]
+interval_ms = 1000             # probe cycle interval
+timeout_ms = 500               # direct probe timeout before escalation
+indirect_k = 2                 # number of indirect probers (PING_REQ)
+suspect_timeout_ms = 3000      # base suspect → dead timeout
+suspect_multiplier = 0.5       # log2 scaling multiplier for suspect timeout
+suspect_jitter_ms = 1000       # max jitter for suspect timeout
+dead_retention_ms = 15000      # how long to keep dead entries before GC
+
+[metrics]
+log_interval_ms = 10000        # console metrics log interval (0 = disabled)
+server_port = 0                # HTTP metrics server port (0 = disabled)

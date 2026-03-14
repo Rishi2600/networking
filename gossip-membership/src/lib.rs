@@ -1,4 +1,5 @@
 pub mod anti_entropy;
+pub mod config;
 pub mod crypto;
 pub mod failure_detector;
 pub mod gossip;
