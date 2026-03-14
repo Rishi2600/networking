@@ -1,30 +1,39 @@
 /// Wire format for gossip messages.
 ///
-/// Fixed 22-byte header followed by a variable-length payload.
+/// Fixed 24-byte header followed by a variable-length payload.
 ///
 /// Header layout (big-endian):
 /// ```text
-///  Byte  0       : kind         (u8)   — GOSSIP / PING / PING_REQ / ACK
-///  Bytes 1-2     : payload_len  (u16)  — number of bytes after the header
-///  Bytes 3-10    : sender_id    (u64)  — originating node identity
-///  Bytes 11-14   : heartbeat    (u32)  — sender's current heartbeat counter
-///  Bytes 15-18   : incarnation  (u32)  — sender's current incarnation number
-///  Byte  19      : flags        (u8)   — bit-0 = REQUEST_ACK
-///  Bytes 20-21   : checksum     (u16)  — RFC 1071 over entire buffer (zeroed for calc)
+///  Byte  0       : version      (u8)   — protocol version (currently 1)
+///  Byte  1       : kind         (u8)   — GOSSIP / PING / PING_REQ / ACK / LEAVE
+///  Bytes 2-3     : payload_len  (u16)  — number of bytes after the header
+///  Bytes 4-11    : sender_id    (u64)  — originating node identity
+///  Bytes 12-15   : heartbeat    (u32)  — sender's current heartbeat counter
+///  Bytes 16-19   : incarnation  (u32)  — sender's current incarnation number
+///  Byte  20      : flags        (u8)   — bit-0 = REQUEST_ACK
+///  Byte  21      : reserved     (u8)   — must be 0 (keeps header 16-bit aligned)
+///  Bytes 22-23   : checksum     (u16)  — RFC 1071 over entire buffer (zeroed for calc)
 /// ```
 ///
 /// All multi-byte integers are big-endian (network byte order).
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+// ── Protocol version ─────────────────────────────────────────────────────────
+/// Current wire format version. Incremented when the header layout or
+/// payload encoding changes in a backwards-incompatible way.
+pub const VERSION: u8 = 1;
+
 // ── Header byte offsets ──────────────────────────────────────────────────────
-pub const OFF_KIND: usize = 0;
-pub const OFF_PLEN: usize = 1; // 2 bytes
-pub const OFF_SENDER_ID: usize = 3; // 8 bytes
-pub const OFF_HEARTBEAT: usize = 11; // 4 bytes
-pub const OFF_INCARNATION: usize = 15; // 4 bytes
-pub const OFF_FLAGS: usize = 19;
-pub const OFF_CHECKSUM: usize = 20; // 2 bytes
-pub const HEADER_LEN: usize = 22;
+pub const OFF_VERSION: usize = 0;
+pub const OFF_KIND: usize = 1;
+pub const OFF_PLEN: usize = 2; // 2 bytes
+pub const OFF_SENDER_ID: usize = 4; // 8 bytes
+pub const OFF_HEARTBEAT: usize = 12; // 4 bytes
+pub const OFF_INCARNATION: usize = 16; // 4 bytes
+pub const OFF_FLAGS: usize = 20;
+pub const OFF_RESERVED: usize = 21; // reserved for future use, keeps header even
+pub const OFF_CHECKSUM: usize = 22; // 2 bytes
+pub const HEADER_LEN: usize = 24;
 
 // ── Message kinds ────────────────────────────────────────────────────────────
 pub mod kind {
@@ -262,6 +271,7 @@ fn encode_node_entries(entries: &[WireNodeEntry], buf: &mut Vec<u8>) {
 // ── Full message ──────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct Message {
+    pub version: u8,
     pub kind: u8,
     pub sender_id: u64,
     pub sender_heartbeat: u32,
@@ -290,6 +300,7 @@ pub enum MessageError {
     LengthMismatch,
     ChecksumFailed,
     UnknownKind(u8),
+    UnsupportedVersion(u8),
     MalformedPayload,
     PayloadTooLarge,
 }
@@ -301,6 +312,7 @@ impl std::fmt::Display for MessageError {
             Self::LengthMismatch => write!(f, "payload length mismatch"),
             Self::ChecksumFailed => write!(f, "checksum verification failed"),
             Self::UnknownKind(k) => write!(f, "unknown message kind 0x{k:02x}"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported protocol version {v}"),
             Self::MalformedPayload => write!(f, "malformed payload"),
             Self::PayloadTooLarge => write!(f, "payload too large for UDP MTU"),
         }
@@ -353,6 +365,7 @@ impl Message {
         let mut buf = vec![0u8; total];
 
         // Header fields.
+        buf[OFF_VERSION] = self.version;
         buf[OFF_KIND] = self.kind;
         buf[OFF_PLEN..OFF_PLEN + 2].copy_from_slice(&(payload_len as u16).to_be_bytes());
         buf[OFF_SENDER_ID..OFF_SENDER_ID + 8].copy_from_slice(&self.sender_id.to_be_bytes());
@@ -374,6 +387,22 @@ impl Message {
     pub fn decode(buf: &[u8]) -> Result<Self, MessageError> {
         if buf.len() < HEADER_LEN {
             return Err(MessageError::BufferTooShort);
+        }
+
+        // ── Version check ─────────────────────────────────────────────────
+        // The version byte is read before the checksum so that we can
+        // produce a specific error for unsupported versions.  Future
+        // versions may change the header layout, so we gate on the
+        // version before interpreting any other field.
+        let wire_version = buf[OFF_VERSION];
+        match wire_version {
+            VERSION => { /* current version — proceed */ }
+            v => {
+                log::debug!(
+                    "[message] rejecting message with unsupported version {v} (expected {VERSION})"
+                );
+                return Err(MessageError::UnsupportedVersion(v));
+            }
         }
 
         let payload_len =
@@ -428,6 +457,7 @@ impl Message {
         };
 
         Ok(Self {
+            version: wire_version,
             kind: msg_kind,
             sender_id,
             sender_heartbeat,
@@ -446,6 +476,7 @@ pub fn build_gossip(
     entries: Vec<WireNodeEntry>,
 ) -> Message {
     Message {
+        version: VERSION,
         kind: kind::GOSSIP,
         sender_id,
         sender_heartbeat,
@@ -462,6 +493,7 @@ pub fn build_ping(
     entries: Vec<WireNodeEntry>,
 ) -> Message {
     Message {
+        version: VERSION,
         kind: kind::PING,
         sender_id,
         sender_heartbeat,
@@ -479,6 +511,7 @@ pub fn build_ping_req(
     target_addr: SocketAddr,
 ) -> Message {
     Message {
+        version: VERSION,
         kind: kind::PING_REQ,
         sender_id,
         sender_heartbeat,
@@ -498,6 +531,7 @@ pub fn build_ack(
     entries: Vec<WireNodeEntry>,
 ) -> Message {
     Message {
+        version: VERSION,
         kind: kind::ACK,
         sender_id,
         sender_heartbeat,
@@ -513,6 +547,7 @@ pub fn build_leave(
     sender_incarnation: u32,
 ) -> Message {
     Message {
+        version: VERSION,
         kind: kind::LEAVE,
         sender_id,
         sender_heartbeat,
@@ -724,6 +759,7 @@ mod tests {
         let mut msg = build_ping(1, 1, 0, vec![]);
         msg.kind = 0xFF;
         let mut buf = msg.encode().unwrap();
+        // Patch the kind byte and recompute checksum.
         buf[OFF_KIND] = 0xFF;
         buf[OFF_CHECKSUM] = 0;
         buf[OFF_CHECKSUM + 1] = 0;
@@ -804,6 +840,70 @@ mod tests {
         assert_eq!(decoded.sender_heartbeat, 42);
         assert_eq!(decoded.sender_incarnation, 3);
         assert!(matches!(decoded.payload, MessagePayload::Leave));
+    }
+
+    // ── Version tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn encode_preserves_version() {
+        let msg = build_ping(1, 0, 0, vec![]);
+        let buf = msg.encode().unwrap();
+        assert_eq!(buf[OFF_VERSION], VERSION);
+    }
+
+    #[test]
+    fn decode_correct_version_succeeds() {
+        let msg = build_ping(42, 7, 0, vec![]);
+        let buf = msg.encode().unwrap();
+        let decoded = Message::decode(&buf).unwrap();
+        assert_eq!(decoded.version, VERSION);
+        assert_eq!(decoded.sender_id, 42);
+    }
+
+    #[test]
+    fn decode_unsupported_version_rejected() {
+        let msg = build_ping(1, 0, 0, vec![]);
+        let mut buf = msg.encode().unwrap();
+        // Patch version to a future value and recompute checksum.
+        buf[OFF_VERSION] = 99;
+        buf[OFF_CHECKSUM] = 0;
+        buf[OFF_CHECKSUM + 1] = 0;
+        let cksum = internet_checksum(&buf);
+        buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].copy_from_slice(&cksum.to_be_bytes());
+        let result = Message::decode(&buf);
+        assert!(
+            matches!(result, Err(MessageError::UnsupportedVersion(99))),
+            "future version must be rejected"
+        );
+    }
+
+    #[test]
+    fn decode_version_zero_rejected() {
+        let msg = build_ping(1, 0, 0, vec![]);
+        let mut buf = msg.encode().unwrap();
+        buf[OFF_VERSION] = 0;
+        buf[OFF_CHECKSUM] = 0;
+        buf[OFF_CHECKSUM + 1] = 0;
+        let cksum = internet_checksum(&buf);
+        buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].copy_from_slice(&cksum.to_be_bytes());
+        let result = Message::decode(&buf);
+        assert!(matches!(result, Err(MessageError::UnsupportedVersion(0))));
+    }
+
+    #[test]
+    fn all_message_kinds_encode_with_version() {
+        for msg in [
+            build_gossip(1, 0, 0, vec![]),
+            build_ping(1, 0, 0, vec![]),
+            build_ping_req(1, 0, 0, 2, v4([127, 0, 0, 1], 9000)),
+            build_ack(1, 0, 0, vec![]),
+            build_leave(1, 0, 0),
+        ] {
+            let buf = msg.encode().unwrap();
+            assert_eq!(buf[OFF_VERSION], VERSION, "kind={} must encode version", msg.kind);
+            let decoded = Message::decode(&buf).unwrap();
+            assert_eq!(decoded.version, VERSION);
+        }
     }
 
     #[test]
